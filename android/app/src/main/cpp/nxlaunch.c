@@ -53,8 +53,9 @@ void nxhost_env_changed(void);
 #pragma weak nxhost_picture_place
 #pragma weak nxhost_fps_cap_set
 #pragma weak nxhost_fps_cap_status
-#pragma weak nxhost_fps_limit_set
-void nxhost_fps_limit_set(int fps);   // hle_fpslock.c: the frame limiter, live from the in-game panel
+#pragma weak nxhost_input_device_player
+#pragma weak nxhost_rumble_callback
+#pragma weak nxhost_rumble_route
 #pragma weak nxhost_text_input_callback
 
 // ---- Log: the host's stdout and stderr go straight into the log file (nothing is lost when the process dies), and a thread copies new lines to logcat ----
@@ -315,48 +316,34 @@ JNIEXPORT jint JNICALL Java_dev_nxnative_android_Native_selftest(JNIEnv *env, jc
     return r;
 }
 
-// ---- Thread placement (Native.pinThreads, every few seconds while the game runs): the replay thread (vk-replay, the most work a frame: 9-18 ms in DKB) gets the
-// fastest cores to itself, and the command encoder (vk-enc: 5-8 ms of work, the rest spinning for the next call, which only heats the core it is on) and the game's own
-// threads (named "0x<id> ...") go to the cores at 75 % of the top clock or more, so none of them runs on the small cores; without such cores they share the fastest. The clusters are the cores' top clocks (cpuinfo_max_freq). Android may reset a thread to all cores,
-// and each call places the ones not where they belong. Returns the number placed by this call ----
-static long cpu_max_khz(int c) {
-    char path[96]; snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", c);
-    FILE *f = fopen(path, "r"); long v = 0; if (f) { if (fscanf(f, "%ld", &v) != 1) v = 0; fclose(f); }
-    return v;
+JNIEXPORT jint JNICALL Java_dev_nxnative_android_Native_devicePlayer(JNIEnv *env, jclass cls, jint device) {
+    (void)env; (void)cls; return nxhost_input_device_player ? nxhost_input_device_player(device) : -1;
 }
-JNIEXPORT jint JNICALL Java_dev_nxnative_android_Native_pinThreads(JNIEnv *env, jclass cls) {
-    (void)env; (void)cls;
-    static cpu_set_t fast, mid; static int ready;
-    if (!ready) {
-        int n = (int)sysconf(_SC_NPROCESSORS_CONF); if (n > CPU_SETSIZE) n = CPU_SETSIZE;
-        long top = 0;
-        for (int c = 0; c < n; c++) { long k = cpu_max_khz(c); if (k > top) top = k; }
-        if (!top) return -1;   // no cpufreq: leave the scheduler alone
-        // Fast: the cores at the top clock. Middle: the others at 75 % of it or more (a mid cluster: 2.8 of 3.19 GHz on a Snapdragon 8 Gen 2, 3.53 of 4.32 on an
-        // 8 Elite), never the small cores (1.8 of 2.8 on an older big.LITTLE). Without a middle group the encoder and the game share the fast cores
-        CPU_ZERO(&fast); CPU_ZERO(&mid);
-        for (int c = 0; c < n; c++) { long k = cpu_max_khz(c); if (k == top) CPU_SET(c, &fast); else if (k * 4 >= top * 3) CPU_SET(c, &mid); }
-        if (!CPU_COUNT(&mid)) mid = fast;
-        ready = 1;
-        fprintf(stderr, "[nxlaunch] thread placement: the replay thread on %d core(s) at %ld MHz, the encoder and the game on %d%s\n",
-                CPU_COUNT(&fast), top / 1000, CPU_COUNT(&mid), CPU_EQUAL(&mid, &fast) ? " (the same: no middle cluster)" : "");
-    }
-    DIR *d = opendir("/proc/self/task"); if (!d) return 0;
-    int placed = 0; struct dirent *e;
-    while ((e = readdir(d))) {
-        int tid = atoi(e->d_name); if (tid <= 0) continue;
-        char path[64], name[32] = ""; snprintf(path, sizeof path, "/proc/self/task/%d/comm", tid);
-        FILE *f = fopen(path, "r"); if (!f) continue;
-        if (!fgets(name, sizeof name, f)) name[0] = 0; fclose(f);
-        name[strcspn(name, "\n")] = 0;
-        int g = !strcmp(name, "vk-replay") ? 1 : !strcmp(name, "vk-enc") || !strncmp(name, "0x", 2) ? 2 : 0;
-        if (!g) continue;   // not a placed thread; looked at again next time (a thread may be renamed after it starts)
-        // Checked every call, not once: the replay thread starts under the name of the game thread that made it, and Android resets every thread to all cores
-        // when it moves the app between foreground and background
-        const cpu_set_t *to = g == 1 ? &fast : &mid; cpu_set_t cur;
-        if (!sched_getaffinity(tid, sizeof cur, &cur) && CPU_EQUAL(&cur, to)) continue;
-        if (!sched_setaffinity(tid, sizeof *to, to)) placed++;   // fails while a core is parked (core control at low load): the next call places it
-    }
-    closedir(d);
-    return placed;
+
+// ---- Rumble: the host calls rumble() on its rumble thread for each change of a player's vibration; it goes to listener.onRumble(player, intensity, sharpness) (Rumble.java),
+// which drives the controller's or the phone's vibrator. The thread is attached to the VM on its first call and stays attached for the process's life ----
+static JavaVM *g_vm;
+static jobject g_rumble;   // a global reference to the listener
+static jmethodID g_on_rumble;
+static void rumble(void *ctx, int player, float intensity, float sharpness) {
+    (void)ctx;
+    static __thread JNIEnv *env;
+    if (!env && (*g_vm)->AttachCurrentThread(g_vm, &env, NULL) != JNI_OK) { env = NULL; return; }
+    (*env)->CallVoidMethod(env, g_rumble, g_on_rumble, (jint)player, (jfloat)intensity, (jfloat)sharpness);
+    if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+}
+// Once, before Native.start: the host starts its rumble thread when the callback is set. false when this host has no rumble
+JNIEXPORT jboolean JNICALL Java_dev_nxnative_android_Native_setRumbleListener(JNIEnv *env, jclass cls, jobject listener) {
+    (void)cls; if (!nxhost_rumble_callback || !listener || g_rumble) return JNI_FALSE;
+    jmethodID m = (*env)->GetMethodID(env, (*env)->GetObjectClass(env, listener), "onRumble", "(IFF)V");
+    if (!m) { (*env)->ExceptionClear(env); return JNI_FALSE; }
+    (*env)->GetJavaVM(env, &g_vm);
+    g_on_rumble = m;
+    g_rumble = (*env)->NewGlobalRef(env, listener);
+    nxhost_rumble_callback(rumble, NULL);
+    return JNI_TRUE;
+}
+// Whether a player has a vibrator: the host sends that player's vibration only while it has one
+JNIEXPORT void JNICALL Java_dev_nxnative_android_Native_rumbleRoute(JNIEnv *env, jclass cls, jint player, jboolean on) {
+    (void)env; (void)cls; if (nxhost_rumble_route) nxhost_rumble_route(player, on);
 }
