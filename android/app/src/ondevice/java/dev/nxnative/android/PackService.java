@@ -400,7 +400,7 @@ public final class PackService extends Service {
                     j.stepState("split", "pending");
                     return "interrupted";
                 }
-                String bad = splitMatchesProfile(j, split);
+                String bad = splitHasShaderMap(split);
                 if (bad != null) return bad;
                 tool = "dm/gfx/tools/vk_android_build.py";
                 argv = new String[] {"--target", "vulkan", new File(split, "pkg").getPath(), lib.getPath()};
@@ -489,27 +489,13 @@ public final class PackService extends Service {
     }
 
     /**
-     * null when the split found the shaders the app's profile lists (its shader_map.tsv byte for byte, as a Mac split of the same dump does), else what to do.
-     * vk_android_build.py builds the keys of the profile's map from the split's package: another map means a dump with other shaders (modified, or incomplete).
+     * The profile's map is the key manifest, not the package's record ordering. vk_android_build.py checks each requested key against the package records
+     * and finds it by hash when a split numbers records differently; it stops if a required shader is actually absent. Do not reject a usable split just
+     * because its generated map differs byte for byte (for example, a different scan order or extra records).
      */
-    private String splitMatchesProfile(Job j, File split) {
-        if (engine.simulated()) return null;
+    private String splitHasShaderMap(File split) {
         File have = new File(split, "shader_map.tsv");
-        try {
-            File want = new File(PackNative.repo(), "dm/games/" + j.titleId() + "/shader_map.tsv");
-            if (java.util.Arrays.equals(Files.readAllBytes(want.toPath()), Files.readAllBytes(have.toPath()))) return null;
-        } catch (IOException | RuntimeException | UnsatisfiedLinkError e) {
-            return "cannot compare the dump's shaders with the app's list: " + e.getMessage();
-        }
-        try {
-            Outputs.delete(split);   // a Retry splits again, from the start
-        } catch (IOException e) {
-            Log.w(TAG, "split: " + e.getMessage());   // its step is pending: the next run's Outputs.begin tries again
-        }
-        Job.deleteTree(j.splitScan(this));
-        j.stepState("split", "pending");
-        return "the dump's shaders are not the ones this app knows for " + j.name() + " (" + Profile.versionName(j.version()) + ", " + have.getName()
-                + " differs). The dump may be incomplete or modified: dump the game again, then Retry";
+        return have.isFile() && have.length() > 0 ? null : "the shader split did not produce shader_map.tsv; Retry to split the dump again";
     }
 
     /** Reads the step's log as it grows: progress lines into the job, the last [RED] line for a failure's message */
