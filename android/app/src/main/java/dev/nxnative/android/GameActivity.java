@@ -146,6 +146,7 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
         pausedView.setOnClickListener(v -> unpause());
         root.addView(pausedView, root.indexOfChild(handle), new FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
         setContentView(root);
+        TextInput.screen(this);   // the keyboard applet's input box shows on this screen (again, when the game was waiting on it as the screen was recreated)
         // The host starts once per process. A screen created again while it runs (Android recreated the activity: "Don't keep activities", a font or language
         // change while in the background) takes its window over; a screen restored into a new process (Android ended the old one while it was in the background)
         // has no game to show: the game was stopped, and the user starts it again
@@ -436,6 +437,8 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
             String gpuNote = GpuDriver.env(this, id, env);   // the game's GPU driver, else the main screen's (DM_VK_DRIVER)
             String ts = Prefs.gpuTs(this, id);   // Game settings › GPU timing; unset: the profile's gpu_timestamps (a DM_NVN_GPU_TS line of env.txt or the game's own lines comes later and wins)
             if (ts != null) env.add("DM_NVN_GPU_TS=" + ts);
+            if (Prefs.instancedDraws(this, id)) env.add("DM_VK_INSTANCE=1");   // Game settings › Instanced draws
+            if (Prefs.classicPasses(this, id)) env.add("DM_VK_CLASSIC_RP=1");   // Game settings › Classic render passes
             env.addAll(user);
             for (String kv : env) if (kv.startsWith("DM_OVERLAY=")) overlayEnv = !kv.substring(11).trim().equals("0");
             String[] args = {"nxhost", packDir.getPath()};
@@ -523,6 +526,7 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
      * The game itself is left as it is: onStop has suspended it
      */
     @Override protected void onDestroy() {
+        TextInput.gone(this);
         ui.removeCallbacksAndMessages(null);
         if (inputManager != null) inputManager.unregisterInputDeviceListener(this);
         if (audio != null) {

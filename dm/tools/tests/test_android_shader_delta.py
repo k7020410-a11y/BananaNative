@@ -106,6 +106,21 @@ class EntryHash(unittest.TestCase):
                       delta.entry_hash(e, bd, c1, [(1, m[0][1])]), delta.entry_hash(e, bd, c1, [(0, spirv(40, 2))]), delta.entry_hash(e, bd, c1, m + [(1, spirv(8, 1))])):
             self.assertNotEqual(h, other)
 
+    def test_high_offset_bits(self):
+        """Offsets past 4 GiB (a blob as Pokemon Pokopia's, 9.8 GB) keep their high bits in the module's off_hi and the entry's c1_off_hi: read as part of the offset
+        (here they point past this small blob, so the entry is refused), and not part of the hash, as the low bits are not"""
+        write_lib(self.tmp / 'A.lib', '111111111111', shaders=[('00000000000000aa', [spirv(40, 1)], b'\x01' * 16)])
+        L = delta.Library(str(self.tmp / 'A.lib')); L.entry(0); mo, eo = L.mo, L.eo; L.close()
+        for at in (mo + 14, eo + 56):   # off_hi, c1_off_hi
+            d = bytearray((self.tmp / 'A.lib').read_bytes()); struct.pack_into('<H', d, at, 1); (self.tmp / 'B.lib').write_bytes(bytes(d))
+            L2 = delta.Library(str(self.tmp / 'B.lib'))
+            with self.assertRaises(ValueError): L2.entry(0)
+            L2.close()
+        self.assertEqual(delta.mod_off(0x10, 2), 0x200000010)
+        e = bytearray(entry('00000000000000aa', c1_off=0x20)); struct.pack_into('<I', e, 56, 3)
+        self.assertEqual(delta.c1_off(e), 0x300000020)
+        self.assertEqual(delta.entry_hash(bytes(e), bind(0), b'', []), delta.entry_hash(entry('00000000000000aa'), bind(0), b'', []), 'c1_off_hi is a position in the file')
+
 
 class Manifest(unittest.TestCase):
     H = {'00000000000000aa': '0123456789abcdef', '00000000000000bb': '-'}
@@ -251,6 +266,23 @@ class Launcher(unittest.TestCase):
         self.assertTrue((old / 'dmsh_vk.lib').is_file(), 'the older library stays')
         self.assertEqual(self.java('restamp', pack, GAME, cur, abi, f'66d1dd2cd5ff:{o}:{n}'), 'none', 'once only: this version has its library')
         self.assertEqual(self.java('restamp', pack, GAME, cur, abi, ''), 'none')
+
+    def test_selection(self):
+        """A profile's shader_seen.tsv: its keys that the map has, sorted, each once (the Mac's selected build: grep the keys, comm with the map's column 4)"""
+        d = self.tmp / 'sel'; d.mkdir(exist_ok=True)
+        (d / 'shader_map.tsv').write_text('# kind: evidence\npackage\tindex\tstage\tdm_ctl_sha16\tsource\n'
+                                          'vs_0.bin\t0\tvs\t00000000000000bb\tx\nps_0.bin\t0\tps\t00000000000000aa\tx\ncs_0.bin\t0\tcs\t00000000000000cc\tx\n')
+        self.assertEqual(self.java('selection', d), 'none', 'no shader_seen.tsv: the whole map')
+        (d / 'shader_seen.tsv').write_text('# a comment 00000000000000cc\nkey\tstage\n00000000000000bb\tvertex\n00000000000000aa\tpixel\n00000000000000dd\tpixel\n00000000000000bb\tvertex\n')
+        self.assertEqual(self.java('selection', d), '00000000000000aa,00000000000000bb', 'only keys of the map, sorted, once')
+
+    def test_selection_of_profiles(self):
+        """Every profile with a selected set: the Java selection is what the Mac's selected build passes (shader_seen.tsv keys in shader_map.tsv)"""
+        for seen in sorted((REPO / 'dm/games').glob('*/shader_seen.tsv')):
+            mp = seen.parent / 'shader_map.tsv'
+            keys = {c[3] for c in (l.rstrip('\n').split('\t') for l in mp.read_text().splitlines()) if len(c) > 3 and not c[0].startswith('#') and c[0] != 'package'}
+            want = sorted({l[:16] for l in seen.read_text().splitlines() if re.match(r'[0-9a-f]{16}', l)} & keys)
+            self.assertEqual(self.java('selection', seen.parent), ','.join(want), seen.parent.name)
 
     def test_translate_and_minutes(self):
         self.assertEqual(self.java('translate', '66d1dd2cd5ff=2322,b430e271aa8a=5000', 'b430e271aa8a,66d1dd2cd5ff'), '2322')
