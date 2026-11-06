@@ -179,6 +179,7 @@ int vka_fg_frame(uint64_t serial, const int *crop, double period, uint64_t fence
     if (!F.chain || F.ext.width != e.width || F.ext.height != e.height || F.flow != flow) {
         if (!rebuild(e, flow)) { vka_tex_drop(im); unavailable("%s", "the frame generation chain could not be made (see the [RED] lines)"); vka_fps_fg(-1, 1); return 0; }
     }
+    { int nxhost_fps_limit_get(void) __attribute__((weak)); F.pacer.decoupled = &nxhost_fps_limit_get && nxhost_fps_limit_get() > 0; }   // hle_fpslock.c's limiter
     lsfg_plan plan = lsfg_pacer_plan(&F.pacer, LSFG_MAX_GENERATIONS, mult, target, mono_s());
     uint64_t count = F.count++;
     int warm = plan.warm && count + 1 >= 2;
