@@ -1,0 +1,139 @@
+name: Android Pokopia APK
+
+on:
+  push:
+    branches: [pokopia-release]
+    paths:
+      - '.github/workflows/android-pokopia.yml'
+      - 'android/**'
+      - 'dm/**'
+      - 'scripts/**'
+      - 'pyproject.toml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-pokopia-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-pokopia-apk:
+    name: Build Pokopia Android APK (native host + on-device packer)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - name: Check out the Pokopia branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Java 17
+        uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up .NET 10 SDK
+        uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Set up Android SDK, NDK and CMake
+        uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4.0.4
+        with:
+          packages: >-
+            platforms;android-36
+            build-tools;36.0.0
+            ndk;28.2.13676358
+            cmake;3.22.1
+
+      - name: Install zsh and configure the pinned Android NDK
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes zsh
+          echo "$ANDROID_HOME/cmake/3.22.1/bin" >> "$GITHUB_PATH"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/28.2.13676358" >> "$GITHUB_ENV"
+          test -x "$ANDROID_HOME/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin/clang"
+          test -x "$ANDROID_HOME/cmake/3.22.1/bin/cmake"
+          test -x "$ANDROID_HOME/cmake/3.22.1/bin/ninja"
+          java -version
+          dotnet --version
+          zsh --version
+
+      - name: Verify Pokopia profile inputs
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          game = Path('dm/games/0400A3A01EE4C000')
+          tsv = (game / 'game.tsv').read_text()
+          notes = (game / 'README.md').read_text()
+          rows = [line for line in (game / 'shader_map.tsv').read_text().splitlines()
+                  if line and not line.startswith('#') and not line.startswith('package\t')]
+          assert 'title_id\t0400A3A01EE4C000' in tsv
+          assert 'build\tv655360' in tsv and 'Ver. 2.0.1' in notes
+          assert len(rows) == 131426, f'Expected 131,426 shader entries, got {len(rows)}'
+          assert any(line.startswith('res_levels\t') for line in tsv.splitlines())
+          print('Pokopia profile verified: title 0400A3A01EE4C000, update 2.0.1 (v655360), 131,426 shaders, dynamic Game resolution.')
+          PY
+
+      - name: Build complete on-device packer stage
+        shell: bash
+        run: |
+          WORK="$RUNNER_TEMP/pokopia-android-build"
+          zsh android/ondevice/build.sh "$WORK" all
+          STAGE="$WORK/stage"
+          for f in \
+            lib/libpython3.14.so \
+            lib/libnxpack.so \
+            lib/libdmsh_xlate.so \
+            lib/libSPIRV-Tools-shared.so \
+            python/lib/python3.14/os.py \
+            bin/dm_pack_cli; do
+            test -s "$STAGE/$f" || { echo "Missing required packer output: $STAGE/$f"; exit 1; }
+          done
+          file "$STAGE"/lib/*.so
+          echo "NX_PACK_STAGE=$STAGE" >> "$GITHUB_ENV"
+
+      - name: Build Pokopia-specific APK and native libraries
+        shell: bash
+        working-directory: android/app
+        run: |
+          ./gradlew --no-daemon --max-workers=2 \
+            -PnxGames=0400A3A01EE4C000 \
+            -PnxApp=pokopia \
+            -PnxPackStage="$NX_PACK_STAGE" \
+            apk
+          test -s out/nxnative-android-pokopia.apk
+
+      - name: Verify APK contents and embedded Pokopia profile
+        shell: bash
+        working-directory: android/app
+        run: |
+          APK=out/nxnative-android-pokopia.apk
+          unzip -l "$APK" > "$RUNNER_TEMP/apk-files.txt"
+          for lib in \
+            libnxhost_0400A3A01EE4C000.so \
+            libnxlaunch_0400A3A01EE4C000.so \
+            libnxpack.so \
+            libpython3.14.so \
+            libdmsh_xlate.so \
+            libSPIRV-Tools-shared.so; do
+            grep -Fq "$lib" "$RUNNER_TEMP/apk-files.txt" || { echo "APK missing $lib"; exit 1; }
+          done
+          unzip -p "$APK" assets/pack/tools.zip > "$RUNNER_TEMP/pokopia-tools.zip"
+          unzip -l "$RUNNER_TEMP/pokopia-tools.zip" | grep -F 'dm/games/0400A3A01EE4C000/game.tsv'
+          unzip -p "$RUNNER_TEMP/pokopia-tools.zip" dm/games/0400A3A01EE4C000/game.tsv | grep -F 'res_levels'
+          echo "Verified APK: $APK (Pokopia host + launcher, embedded native packer, translator, validator and Pokopia profile)."
+
+      - name: Upload Pokopia APK artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: BananaNative-Pokopia-Android-APK
+          path: android/app/out/nxnative-android-pokopia.apk
+          if-no-files-found: error
+          retention-days: 30
