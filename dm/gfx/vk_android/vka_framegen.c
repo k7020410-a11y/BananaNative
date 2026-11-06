@@ -196,6 +196,9 @@ int vka_fg_frame(uint64_t serial, const int *crop, double period, uint64_t fence
         // The game's frame period: the present's, or the measured one when longer. With DM_PRESENT_INTERVAL=display (Donkey Kong Bananza's uncapped mode) every present
         // declares the host's tick (8.3 ms at 120 Hz) whatever the game's own rate, which left no refresh for a generated frame and generation never started
         double gp = F.pacer.smoothed_interval > period ? F.pacer.smoothed_interval : period;
+        // ... and never shorter than the host's frame limit allows: a game held at 60 on a 120 Hz panel has two refreshes a frame, but its presents ride the tick, so
+        // the measured interval came out at 15.3-15.5 ms (1.85 refreshes, under the 1.9 below) and the one generated frame that fits was refused
+        { int nxhost_fps_limit_get(void) __attribute__((weak)); int lim = &nxhost_fps_limit_get ? nxhost_fps_limit_get() : 0; if (lim > 0 && gp < 1.0 / lim) gp = 1.0 / lim; }
         double n = gp * 1e9 / (double)rns;   // refreshes in a game frame (60 fps on 120.46 Hz: 2.01; on 60.00 Hz: 1.00)
         size_t fit = n < 1.9 ? 0 : (size_t)(n + 0.1) - 1;
         if (ng > fit) { ng = fit; capped = 1; F.pacer.issued = ng; }   // the pacer counts what was generated (its unloaded rate is measured on frames without)
