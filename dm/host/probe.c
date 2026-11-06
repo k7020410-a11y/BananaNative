@@ -183,6 +183,8 @@ static void probe_add(module_t *m, uint64_t off, long dump, probe_fn fn) {
 // the old and new values and a backtrace. Any other instruction (atomics, exclusives) is logged once per pc and the page is unprotected for it, then protected again a millisecond later
 // (a store in that millisecond goes unseen). STEINS;GATE RE:BOOT: the engine object's page takes bursts of stores every frame, and a watch that unprotected the page for each fault missed
 // the one that matters; this one found it at once (main+0x389e90, a setter its start-up code calls with 0: the game renders 1280x720 docked by its own choice)
+static void watch_start(void);
+static atomic_flag g_wlk = ATOMIC_FLAG_INIT;   // held while the watched page is opened and shut around one store (handler threads, the arming thread)
 static uint64_t g_wat, g_wlen, g_wpg, g_wpsz; static uint8_t *g_walias; static _Atomic int g_warmed;
 static void watch_where(const char *tag, uint64_t a) {
     module_t *m = module_of((void *)a); Dl_info di;
@@ -238,12 +240,14 @@ static int watch_fault(void *addr, int is_write, void *ucv) {
     uint64_t a = (uint64_t)addr;
     if (!is_write || a < g_wpg || a >= g_wpg + g_wpsz) return 0;
     ucontext_t *uc = ucv; uint64_t pc = PLAT_UC_PC(uc), ea = 0, wbv = 0; unsigned len = 0; int wb = -1; uint8_t data[64];
-    if (g_walias && watch_decode(uc, *(uint32_t *)pc, &ea, &len, data, &wb, &wbv)) {
+    if (watch_decode(uc, *(uint32_t *)pc, &ea, &len, data, &wb, &wbv)) {   // (no alias mapping, Android: the page is opened for this one store and shut again, microseconds)
         int hit = ea < g_wat + g_wlen && ea + len > g_wat; uint64_t old = hit ? watch_val() : 0;
+        if (!g_walias) { while (atomic_flag_test_and_set(&g_wlk)) {} mprotect((void *)g_wpg, g_wpsz, PROT_READ | PROT_WRITE); }
         for (unsigned i = 0; i < len; i++) {   // bytes in the watched page go through the alias; a store crossing into the next page writes the rest directly
             uint64_t b = ea + i;
-            if (b >= g_wpg && b < g_wpg + g_wpsz) g_walias[b - g_wpg] = data[i]; else *(volatile uint8_t *)b = data[i];
+            if (g_walias && b >= g_wpg && b < g_wpg + g_wpsz) g_walias[b - g_wpg] = data[i]; else *(volatile uint8_t *)b = data[i];
         }
+        if (!g_walias) { if (atomic_load(&g_warmed)) mprotect((void *)g_wpg, g_wpsz, PROT_READ); atomic_flag_clear(&g_wlk); }
         if (wb >= 0) { if (wb == 31) PLAT_UC_SP(uc) = wbv; else if (wb == 29) PLAT_UC_FP(uc) = wbv; else if (wb == 30) PLAT_UC_LR(uc) = wbv; else PLAT_UC_X(uc, wb) = wbv; }
         PLAT_UC_PC(uc) = pc + 4;
         if (hit) {
@@ -256,6 +260,26 @@ static int watch_fault(void *addr, int is_write, void *ucv) {
         }
         return 1;
     }
+    // CAS / CASA / CASL / CASAL (all sizes) carried out here, without an alias: every store to the page faults, so doing them one at a time under a lock is atomic
+    // for all writers (Donkey Kong Bananza: a lock on the watched page takes thousands a second; opening the page for each let the stage name's write slip through)
+    { uint32_t in = *(uint32_t *)pc;
+      if ((in & 0x3fa07c00) == 0x08a07c00) {
+          unsigned sz = 1u << (in >> 30), rs = (in >> 16) & 31, rn = (in >> 5) & 31, rt = in & 31;
+          uint64_t a = rn == 31 ? PLAT_UC_SP(uc) : PLAT_UC_X(uc, rn), mask = sz == 8 ? ~0ull : (1ull << (8 * sz)) - 1;
+          uint64_t cmp = (rs == 31 ? 0 : PLAT_UC_X(uc, rs)) & mask, nv = (rt == 31 ? 0 : PLAT_UC_X(uc, rt)) & mask, old = 0;
+          while (atomic_flag_test_and_set(&g_wlk)) {}
+          mprotect((void *)g_wpg, g_wpsz, PROT_READ | PROT_WRITE);
+          memcpy(&old, (void *)a, sz);
+          int hit = old == cmp && a < g_wat + g_wlen && a + sz > g_wat;
+          if (old == cmp) { __atomic_thread_fence(__ATOMIC_SEQ_CST); memcpy((void *)a, &nv, sz); __atomic_thread_fence(__ATOMIC_SEQ_CST); }
+          if (atomic_load(&g_warmed)) mprotect((void *)g_wpg, g_wpsz, PROT_READ);
+          atomic_flag_clear(&g_wlk);
+          if (rs != 31) PLAT_UC_X(uc, rs) = old;
+          PLAT_UC_PC(uc) = pc + 4;
+          if (hit) { flockfile(stderr); fprintf(stderr, "[dm] WATCH %#llx compare-and-swap at %#llx: %#llx -> %#llx", (unsigned long long)g_wat, (unsigned long long)a, (unsigned long long)old, (unsigned long long)nv);
+                     watch_where("pc", pc); watch_where("lr", PLAT_UC_LR(uc)); fputc('\n', stderr); dm_backtrace(PLAT_UC_FP(uc)); funlockfile(stderr); }
+          return 1;
+      } }
     // Exclusive and atomic stores (STXR / STLXR / STLR / STXP, CAS, SWP, LD<op>) address [Xn] with no offset: one that reaches the watched bytes is reported like a store, every time
     // (its new value lands when it runs on the unprotected page). Tears of the Kingdom's memory-shortage flag is set by such a store, and the page it lies on takes many of them
     { uint32_t in = *(uint32_t *)pc; int ex = (in & 0x3f000000) == 0x08000000, at = (in & 0x3f200c00) == 0x38200000;   // exclusive class (CAS / CASP among them); LD<op> / SWP
@@ -276,7 +300,9 @@ static int watch_fault(void *addr, int is_write, void *ucv) {
     { static uint64_t seen[16]; static _Atomic int ns; int k = 0, n = atomic_load(&ns);   // not a store form the handler carries out: let it run on an unprotected page
       while (k < n && k < 16 && seen[k] != pc) k++;
       if (k == n && n < 16) { seen[atomic_fetch_add(&ns, 1) & 15] = pc; flockfile(stderr); fprintf(stderr, "[dm] WATCH: instruction %08x not emulated, page unprotected for it:", *(uint32_t *)pc); watch_where("pc", pc); fputc('\n', stderr); funlockfile(stderr); } }
+    while (atomic_flag_test_and_set(&g_wlk)) {}
     mprotect((void *)g_wpg, g_wpsz, PROT_READ | PROT_WRITE); atomic_store(&g_warmed, 0);
+    atomic_flag_clear(&g_wlk);
     return 1;
 }
 static void *watch_arm(void *p) {
@@ -287,9 +313,11 @@ static void *watch_arm(void *p) {
             if (!plat_mem_region(g_wpg, &ra, &rs, &prot) && ra <= g_wpg && (prot & PROT_WRITE)) {
                 if (!g_walias) {   // a second, writable mapping of the same page, for the handler's stores
                     g_walias = plat_mem_alias((void *)g_wpg, g_wpsz);
-                    LOG("WATCH %#llx armed, value %#llx%s", (unsigned long long)g_wat, (unsigned long long)watch_val(), g_walias ? "" : " ([RED] no alias mapping: every store unprotects the page)");
+                    static uint64_t told; if (told != g_wat) { told = g_wat; LOG("WATCH %#llx armed, value %#llx%s", (unsigned long long)g_wat, (unsigned long long)watch_val(), g_walias ? "" : " (no alias mapping: each store goes through with the page opened for it)"); }
                 }
-                atomic_store(&g_warmed, 1); mprotect((void *)g_wpg, g_wpsz, PROT_READ); }
+                while (atomic_flag_test_and_set(&g_wlk)) {}
+                atomic_store(&g_warmed, 1); mprotect((void *)g_wpg, g_wpsz, PROT_READ);
+                atomic_flag_clear(&g_wlk); }
         }
         usleep(1000);
     }
@@ -347,8 +375,18 @@ static void watch_install(void) {
                if (*end == '=') { g_pwant = 1; g_pval = strtoull(end + 1, 0, 16); }
                if (!g_poll || !g_plen || g_plen > 8) die("DM_PROBE_POLL format: <address>[+<length up to 8>][=<value>] (hex)");
                pthread_t t; pthread_create(&t, NULL, poll_run, NULL); pthread_detach(t); } }
+    watch_start();
+}
+static void watch_start(void) {   // DM_PROBE_WATCH at start, or later through the live control (probe_live)
     const char *e = getenv("DM_PROBE_WATCH"); if (!e) return;
-    char *end; g_wat = strtoull(e, &end, 16); g_wlen = *end == '+' ? strtoull(end + 1, 0, 16) : 8;
+    char *end; uint64_t want = strtoull(e, &end, 16);
+    if (g_wat) {   // a new address through the live control: the old page writable again, the arming thread takes the new one
+        if (want == g_wat) return;
+        atomic_store(&g_warmed, 1); mprotect((void *)g_wpg, g_wpsz, PROT_READ | PROT_WRITE);
+        g_wlen = *end == '+' ? strtoull(end + 1, 0, 16) : 8; g_wpg = want & ~(g_wpsz - 1); g_walias = NULL; g_wat = want; atomic_store(&g_warmed, 0);
+        LOG("write watch moved to %#llx + %#llx", (unsigned long long)g_wat, (unsigned long long)g_wlen); return;
+    }
+    g_wat = want; g_wlen = *end == '+' ? strtoull(end + 1, 0, 16) : 8;
     if (!g_wat || !g_wlen) die("DM_PROBE_WATCH format: <address>[+<length>] (hex)");
     g_wpsz = (uint64_t)getpagesize(); g_wpg = g_wat & ~(g_wpsz - 1);
     if (g_wat + g_wlen > g_wpg + g_wpsz) die("DM_PROBE_WATCH: the watched bytes must lie in one host page");
@@ -359,145 +397,88 @@ static void watch_install(void) {
 
 #endif
 
-// ---------- Donkey Kong Bananza: its dynamic resolution's range ----------
-// The game picks its render size between NdsrUpscaleMinRate and NdsrUpscaleMaxRate below its upscaler's target (ProjectGraphicsParam; the level's 1.375 and 2.0: 73 % to
-// 50 % of the target on each side), holding the GPU near MaintainGpuPercentage. Its controller reads both from their parameter objects on every decision (update
-// at main+0x38e0f0: [params+0x5d0]+0x64 the max rate, main+0x38dd00: [params+0x5c8]+0x64 the min rate, params = [controller+0x10]), so a store there applies at once.
-// The parameter object is found by a probe at main+0x38e100 (ldr x8, [x10, #0x5d0]: x10 is it), removed after its first hit. DM_DRS=<min %>,<max %> of the target at
-// start (100,100: always the full target, the upscaler a 1:1 copy), live nxhost_drs_set; unset or 0: the game's own range. Build e25c90c1 only
-static _Atomic uint64_t g_drs_params; static _Atomic uint32_t g_drs_want; static float g_drs_orig[2]; static int g_drs_have_orig;
-static void drs_apply(void) {
-    uint64_t p = atomic_load(&g_drs_params), pmin, pmax; if (!p) return;
-    if (plat_mem_read(p + 0x5c8, &pmin, 8) || plat_mem_read(p + 0x5d0, &pmax, 8) || !pmin || !pmax) return;
-    float *fmin = (float *)(uintptr_t)(pmin + 0x64), *fmax = (float *)(uintptr_t)(pmax + 0x64);
-    if (!g_drs_have_orig) { g_drs_orig[0] = *fmin; g_drs_orig[1] = *fmax; g_drs_have_orig = 1; }
-    uint32_t w = atomic_load(&g_drs_want), lo = w >> 16, hi = w & 0xffff;
-    if (!w) { *fmin = g_drs_orig[0]; *fmax = g_drs_orig[1]; LOG("dynamic resolution: the game's own range (rates %.3f-%.3f)", g_drs_orig[0], g_drs_orig[1]); return; }
-    *fmin = 100.0f / (float)hi; *fmax = 100.0f / (float)lo;   // (the smaller rate is the larger size)
-    LOG("dynamic resolution: %u-%u %% of the upscaler's target (rates %.3f-%.3f)", lo, hi, *fmin, *fmax);
+#if !PLAT_IOS
+// ---------- Dev tools, changed while the game runs (DM_DEVTOOLS=1 at start; off by default, nothing below runs without it) ----------
+// A thread looks at the live control's generation (vka_ctl.c: an "env KEY=VALUE" line in DM_CTL, android/tools/nxctl.sh env) five times a second and, when it moved,
+// reads DM_PROBE_LIVE, DM_PROBE_WATCH and DM_TELEPORT again
+extern _Atomic uint32_t vka_env_gen __attribute__((weak));
+static int devtools_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("DM_DEVTOOLS"); on = e && atoi(e) > 0; } return on; }
+static module_t *main_mod(void) { for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main")) return &g_mod[i]; return NULL; }
+// Teleport into a stage the way a door does (Donkey Kong Bananza, main build e25c90c1 only). A door calls main+0x14fd3a0(holder, stage, arrival GUID): main+0x14fd3f0
+// fills the stage-change request (stage name string at +0x18, scenario +0x20, arrival GUID string at +0x28, type +0x30 = 1, +0x34 = 2) and sets its flag byte +0; the
+// scene ends and the sequence (main+0x668684) builds the stage named there. The request is a heap object whose two strings point at buffers inside it (+0x158 and
+// +0x288): found by that shape in the game's read-write memory on the first DM_TELEPORT (a second or two), kept while it still has it. DM_TELEPORT=<stage>,<arrival GUID> writes it and sets the flag; DM_TELEPORT=? logs the last request (go through
+// a door, then ask: that pair is a target). Limits: from the overworld only (a sublevel requested from inside another one asks for a second stage heap and crashes the
+// load), and leaving a teleported stage reloads it instead of returning to the overworld
+static uint64_t g_tp;   // the request, once found
+static int tp_shape(uint64_t r) { uint64_t a = 0, b = 0; return !plat_mem_read(r + 0x18, &a, 8) && !plat_mem_read(r + 0x28, &b, 8) && a == r + 0x158 && b == r + 0x288; }
+static uint64_t tp_find(void) {
+    if (g_tp && tp_shape(g_tp)) return g_tp;
+    g_tp = 0;
+    FILE *f = fopen("/proc/self/maps", "r"); if (!f) return 0;
+    char line[512]; unsigned long long lo, hi; char perm[8];
+    while (!g_tp && fgets(line, sizeof line, f)) {
+        if (sscanf(line, "%llx-%llx %7s", &lo, &hi, perm) != 3 || perm[0] != 'r' || perm[1] != 'w' || lo < 0x4000000000ull || hi > 0x8000000000ull) continue;
+        for (uint64_t q = lo; q + 0x300 <= hi; q += 8)   // guest memory is mapped at its own addresses
+            if (*(volatile uint64_t *)(uintptr_t)(q + 0x18) == q + 0x158 && *(volatile uint64_t *)(uintptr_t)(q + 0x28) == q + 0x288) { g_tp = q; break; }
+    }
+    fclose(f);
+    return g_tp;
 }
-// The controller's own paths do not all honor the range: when the frame rate falls below 30 (and when a caller hands it a rate, [x1+0x2c]) it picks a rate of its own,
-// the level's 2.0 at 1080p, so with the range at 100 % the picture still dropped to half size for a stretch about every 0.6 s (blurred, with a hitch at each switch;
-// 2026-11-05). Every path meets at main+0x38de2c (ldr x9, [x19, #0xf0]) with its pick in s8, before it is snapped to the rate steps and stored: a second probe there
-// (kept: one trap a decision, a frame) clamps s8 into the range chosen, or the game's own range when none is: it is installed at start
-#if defined(__linux__) && defined(__aarch64__)
-#include <asm/sigcontext.h>
-static float *uc_sreg(ucontext_t *uc, int n) {   // the low lane of vector register n in the signal frame (written back at the signal's return)
-    struct _aarch64_ctx *h = (struct _aarch64_ctx *)(void *)uc->uc_mcontext.__reserved;
-    for (int k = 0; k < 32 && h->magic && h->size; k++) { if (h->magic == FPSIMD_MAGIC) return (float *)(void *)&((struct fpsimd_context *)(void *)h)->vregs[n]; h = (struct _aarch64_ctx *)(void *)((char *)h + h->size); }
+static int tp_str(uint64_t obj, char *out, size_t n, uint64_t *buf) {   // a request string: a pointer to its own buffer right after it, capacity 0x100
+    uint64_t p = 0; uint32_t cap = 0;
+    if (plat_mem_read(obj, &p, 8) || plat_mem_read(obj + 8, &cap, 4) || p != obj + 12 || cap != 0x100) return -1;
+    if (out) { if (plat_mem_read(p, out, n - 1)) return -1; out[n - 1] = 0; }
+    if (buf) *buf = p;
+    return 0;
+}
+static void teleport_live(void) {
+    const char *e = getenv("DM_TELEPORT"); static char last[160];
+    if (!e || !strcmp(e, last)) return;
+    strlcpy(last, e, sizeof last);
+    module_t *m = main_mod();
+    if (!m || strcmp(m->build_id, "e25c90c1c136638885659fd55bf8a03b")) { LOG("[RED] teleport: only for Donkey Kong Bananza's main build e25c90c1"); return; }
+    uint64_t so = 0, go = 0, sb = 0, gb = 0, req = tp_find(); char st[64], gu[64];
+    if (!req || plat_mem_read(req + 0x18, &so, 8) || plat_mem_read(req + 0x28, &go, 8) || tp_str(so, st, sizeof st, &sb) || tp_str(go, gu, sizeof gu, &gb)) {
+        LOG("[RED] teleport: the stage-change request was not found in the game's memory"); g_tp = 0; return; }
+    if (!strcmp(e, "?")) { LOG("teleport: the last request was %s,%s", st, gu); return; }
+    char stage[128], guid[64]; const char *c = strchr(e, ',');
+    if (!c || c - e >= (long)sizeof stage || strlen(c + 1) >= sizeof guid) { LOG("[RED] teleport: DM_TELEPORT=<stage>,<arrival GUID> (or ? for the last door's)"); return; }
+    memcpy(stage, e, (size_t)(c - e)); stage[c - e] = 0; strlcpy(guid, c + 1, sizeof guid);
+    char *sp = (char *)(uintptr_t)sb, *gp = (char *)(uintptr_t)gb;
+    memset(sp, 0, 128); memcpy(sp, stage, strlen(stage)); memset(gp, 0, 64); memcpy(gp, guid, strlen(guid));
+    *(int32_t *)(uintptr_t)(req + 0x20) = 1; *(int32_t *)(uintptr_t)(req + 0x30) = 1; *(int32_t *)(uintptr_t)(req + 0x34) = 2;
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    *(volatile uint8_t *)(uintptr_t)req = 1;
+    LOG("teleport: to %s (arrival %s), was %s (request at %#llx)", stage, guid, st, (unsigned long long)req);
+}
+// DM_PROBE_LIVE=<hex offset>[,...] (into main): each new offset gets a printing probe while the game runs, no restart (at most 6 printed hits each unless
+// DM_PROBE_LIMIT says otherwise). The same rules as DM_PROBE: function entries, never a PC-relative instruction
+static void probe_live(void) {
+    watch_start();
+    teleport_live();
+    module_t *m = main_mod(); const char *e = getenv("DM_PROBE_LIVE"); if (!e || !m) return;
+    if (!g_probe_limit) g_probe_limit = 6;
+    char spec[512]; strlcpy(spec, e, sizeof spec);
+    for (char *t = strtok(spec, ","); t; t = strtok(NULL, ",")) {
+        uint64_t off = strtoull(t, 0, 16), at = (uint64_t)m->base + off; int have = 0;
+        for (int i = 0; i < g_nprobe; i++) if (g_probe[i].at == at) have = 1;
+        if (!have && off && g_nprobe < MAX_PROBE) { probe_add(m, off, -1, NULL); LOG("probe: main+%#llx added while running", (unsigned long long)off); }
+    }
+}
+static void *devtools_run(void *arg) {
+    (void)arg; uint32_t gen = 0;
+    for (;;) { usleep(200000); uint32_t g = atomic_load_explicit(&vka_env_gen, memory_order_relaxed); if (g != gen) { gen = g; probe_live(); } }
     return NULL;
 }
-#else
-static float *uc_sreg(ucontext_t *uc, int n) { (void)uc; (void)n; return NULL; }
+static void devtools_start(void) {
+    if (!devtools_on()) return;
+    if (!&vka_env_gen) { LOG("[RED] dev tools: this host has no live control (vka_env_gen): DM_DEVTOOLS does nothing"); return; }
+    pthread_t t; pthread_create(&t, NULL, devtools_run, NULL); pthread_detach(t);
+    LOG("dev tools on (DM_DEVTOOLS): DM_PROBE_LIVE, DM_PROBE_WATCH and DM_TELEPORT are read again at each live control change");
+}
 #endif
-static module_t *g_drs_mod;
-extern _Atomic uint32_t vka_env_gen __attribute__((weak));   // the live control's generation (vka_ctl.c): DM_DRS changed while the game runs is taken at the next decision
-int nxhost_fps(float *out, int n) __attribute__((weak));   // the measured frame rate (vka_fps.c)
-int nxhost_fps_limit_get(void) __attribute__((weak));   // a frame limiter's cap where the host has one
-static int drs_cap(void) {   // the frame rate the dynamic resolution aims at: the limiter's cap, else the frame rate cap (DM_FPS_TARGET; 0 or unset: the game's 60)
-    int c = &nxhost_fps_limit_get ? nxhost_fps_limit_get() : 0;
-    if (c <= 0) { const char *e = getenv("DM_FPS_LIMIT"); if (!e || atoi(e) <= 0) e = getenv("DM_FPS_TARGET"); c = e ? atoi(e) : 0; }
-    return c > 0 && c <= 60 ? c : 60;
-}
-static void drs_clamp(ucontext_t *uc) {
-    if (&vka_env_gen) { static uint32_t gen; uint32_t g = atomic_load_explicit(&vka_env_gen, memory_order_relaxed);
-        if (g != gen) { gen = g; const char *e = getenv("DM_DRS"); int a = 0, b = 0; if (e) sscanf(e, "%d,%d", &a, &b);
-            if (a < 10 || b < a) a = b = 0; if (b > 100) b = 100; uint32_t w = a > 0 ? (uint32_t)a << 16 | (uint32_t)b : 0;
-            if (e && w != atomic_load(&g_drs_want)) atomic_store(&g_drs_want, w); } }   // the range chosen, else the game's own (its picks went to rate 1.0 for 0.6 s every few seconds: full size the GPU could not hold)
-    uint32_t w = atomic_load(&g_drs_want); float lo, hi;
-    if (w) { lo = 100.0f / (float)(w & 0xffff); hi = 100.0f / (float)(w >> 16); }   // rates: lo the full size end
-    else if (g_drs_have_orig) { lo = g_drs_orig[0]; hi = g_drs_orig[1]; }
-    else return;
-    float *s8 = uc_sreg(uc, 8), *s9 = uc_sreg(uc, 9); if (!s8 || !s9) return;
-    float pick = *s8, cur = *s9, out = pick;   // s9: the rate in use (the controller loads it first, [[ctrl+0xf0]+0x270]+0xc)
-    if (out < lo) out = lo; else if (out > hi) out = hi;
-    // A step to a larger size only after a wait: every change of the rate in use cost the GPU several slow frames (Donkey Kong Bananza at 1080p, a light area: the
-    // controller flipped 2.0 / 1.833 every few frames, five frames at three times their GPU time about once a second, the hitching gone with a fixed size). A smaller size
-    // at once; a larger one only when the last step down is DM_DRS_BACKOFF (s, default 1) behind, a wait that doubles (to 30 s) each time a step up is taken back within
-    // 2 s and halves after 10 s without one. DM_DRS_BACKOFF=0: the controller's steps as they come
-    // Slack: a smaller size only once the game's measured frame rate (nxhost_fps, a 1 s window) is DM_DRS_SLACK % (default 15) under the cap chosen: at 60, below 51 fps; the
-    // game's own GPU budget alone stepped down at frame rates the player could not tell from 60 (2026-11-06)
-    {   static int slack = -1; if (slack < 0) { const char *e = getenv("DM_DRS_SLACK"); slack = e ? atoi(e) : 15; }
-        float v[1]; int cap = drs_cap();
-        if (slack > 0 && out > cur + 0.001f && &nxhost_fps && nxhost_fps(v, 1) && v[0] >= cap * (100 - slack) / 100.0f) out = cur;
-    }
-    static float base = -1, wait_s; static double last_down, last_up, calm_since;
-    if (base < 0) { const char *e = getenv("DM_DRS_BACKOFF"); base = e ? (float)atof(e) : 1.0f; wait_s = base; }
-    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); double now = (double)ts.tv_sec + ts.tv_nsec / 1e9;
-    if (base > 0 && cur >= lo && cur <= hi + 0.001f) {
-        if (out > cur + 0.001f) {   // smaller: at once; a step up taken back soon doubles the wait
-            if (now - last_up < 2.0) { wait_s = wait_s * 2 > 30 ? 30 : wait_s * 2; calm_since = now; }
-            last_down = now;
-        } else if (out < cur - 0.001f) {   // larger: only after the wait
-            if (now - last_down < wait_s) out = cur; else last_up = now;
-        }
-        if (now - calm_since > 10 && wait_s > base) { wait_s = wait_s / 2 < base ? base : wait_s / 2; calm_since = now; }
-    }
-    *s8 = out;
-    static float last_out; static _Atomic int nlog;
-    if (out != last_out && atomic_fetch_add(&nlog, 1) < 300)
-        { float v[1] = {0}; if (&nxhost_fps) nxhost_fps(v, 1);
-          LOG("dynamic resolution: rate %.3f at %.2f s (controller picked %.3f, in use %.3f, range %.3f-%.3f, step-up wait %.0f s, %.1f fps)", out, now, pick, cur, lo, hi, wait_s, v[0]); }
-    last_out = out;
-}
-// The controller holds the GPU time under a budget, [x1+8] minus a margin [ctrl+0xe8] (main+0x38dcb8: ldr s1, [x20, #8]), the game's 60 fps frame whatever the frame
-// limiter allows; with a cap of 30 it still shrank the picture to fit 16.7 ms. A third probe, on the next instruction (main+0x38dcbc, ldr s2, [x19, #0xe8]: s1 is loaded,
-// x16 unused here), sets s1 to the frame time of the cap the player chose (drs_cap), in the unit the game's own value is in
-static void drs_budget(ucontext_t *uc) {
-    float *s1 = uc_sreg(uc, 1); if (!s1) return;
-    static _Atomic int noted; if (!atomic_exchange(&noted, 1)) LOG("dynamic resolution: the game's GPU budget %.1f %% of its frame", *s1);
-    int cap = drs_cap();
-    *s1 *= 60.0f / (float)cap;   // the budget is a share of the game's 60 fps frame (the frame-rate controller is held at 1 interval): a cap of 30 allows twice the GPU time
-    static int last; if (cap != last) { last = cap; LOG("dynamic resolution: aimed at %d fps (budget %.1f %% of a 60 fps frame)", cap, *s1); }
-}
-// Some areas' presets turn the dynamic resolution off ([preset+0x29] = 0: a fixed rate, [preset+0x2c], 1.5 in the Wild level's battle stages): with a range chosen the flag
-// is set before the controller reads it (main+0x38dbc8, ldrb w8, [x20, #0x29]), so every area adapts within the range
-static void drs_auto(ucontext_t *uc) {
-    if (!atomic_load(&g_drs_want)) return;
-    uint8_t *f = (uint8_t *)(uintptr_t)(PLAT_UC_X(uc, 20) + 0x29);
-    if (!*f) { *f = 1; static _Atomic int n; if (atomic_fetch_add(&n, 1) < 20) LOG("dynamic resolution: preset %#llx made automatic (its fixed rate %.3f)", (unsigned long long)PLAT_UC_X(uc, 20), *(float *)(void *)(f + 3)); }
-}
-static _Atomic int g_drs_clamp_on;
-static void drs_hit(ucontext_t *uc) { if (!atomic_load(&g_drs_params)) { atomic_store(&g_drs_params, PLAT_UC_X(uc, 10)); drs_apply(); } }
-__attribute__((visibility("default"))) void nxhost_drs_set(int min_pct, int max_pct) {
-    if (min_pct < 10) min_pct = 0; if (max_pct > 100) max_pct = 100; if (min_pct > max_pct) min_pct = max_pct;
-    atomic_store(&g_drs_want, min_pct > 0 ? (uint32_t)min_pct << 16 | (uint32_t)max_pct : 0); drs_apply();
-    if (g_drs_mod && !atomic_exchange(&g_drs_clamp_on, 1)) {
-        if (*(uint32_t *)(g_drs_mod->base + 0x38de2c) == 0xf9407a69u) { probe_add(g_drs_mod, 0x38de2c, -1, drs_clamp); LOG("dynamic resolution: the controller's own picks clamped into the range too"); }
-        else LOG("[RED] dynamic resolution: main+0x38de2c is not the controller's meeting point: its own picks stay");
-        if (*(uint32_t *)(g_drs_mod->base + 0x38dcbc) == 0xbd40ea62u) probe_add(g_drs_mod, 0x38dcbc, -1, drs_budget);
-        else LOG("[RED] dynamic resolution: main+0x38dcbc is not the budget load: it aims at the game's own frame rate");
-        if (*(uint32_t *)(g_drs_mod->base + 0x38dbc8) == 0x3940a688u) probe_add(g_drs_mod, 0x38dbc8, -1, drs_auto);
-        else LOG("[RED] dynamic resolution: main+0x38dbc8 is not the preset's auto flag: fixed-rate areas stay fixed");
-    }
-}
-// The game renders its scene at 80 % of the window and scales the rest up itself: at a scene's start it sets its frame buffer scale to a base (1.0) times a per-mode table
-// entry (0.8, 0.8 here; main+0x30f8f4 and +0x30f904, the two fmul), and the render targets and the upscaler's target are the window times that scale (main+0x790b0).
-// DM_DRS_NATIVE (default 1): the two products become the base alone (fmov s0, s1; nop), so the target is the whole window: dynamic resolution "Off" is the native size and
-// its percentages are of the window. 0: the game's own 80 %. Patched at start, before the game runs, only where the build's words are the expected ones
-static int code_patch(module_t *m, uint64_t off, uint32_t want, uint32_t put) {
-    uint32_t *w = (uint32_t *)(m->base + off);
-    if (*w != want) return 0;
-    uint64_t ps = (uint64_t)getpagesize(), pg = (uint64_t)w & ~(ps - 1);
-    if (mprotect((void *)pg, ps, PROT_READ | PROT_WRITE)) return 0;
-    *w = put; mprotect((void *)pg, ps, PROT_READ | PROT_EXEC); plat_icache_invalidate(w, 4);
-    return 1;
-}
-static void drs_native(module_t *m) {
-    const char *e = getenv("DM_DRS_NATIVE"); if (e && !atoi(e)) { LOG("dynamic resolution: the game's own 80 %% of the window (DM_DRS_NATIVE=0)"); return; }
-    int a = code_patch(m, 0x30f8f4, 0x1e200820u, 0x1e204020u), b = code_patch(m, 0x30f904, 0x1e210800u, 0xd503201fu);
-    if (a && b) LOG("dynamic resolution: the scene at the window's full size (the game's 80 %% frame buffer scale patched out; DM_DRS_NATIVE=0 keeps it)");
-    else LOG("[RED] dynamic resolution: main+0x30f8f4 / +0x30f904 are not the frame buffer scale's products: the game keeps its 80 %%");
-}
-static void drs_install(void) {
-    module_t *m = NULL; for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main")) m = &g_mod[i];
-    if (!m || strcmp(m->build_id, "e25c90c1c136638885659fd55bf8a03b") || *(uint32_t *)(m->base + 0x38e100) != 0xf942e948u) return;
-    probe_add(m, 0x38e100, -1, drs_hit); g_probe[g_nprobe - 1].once = 1;
-    drs_native(m);
-    g_drs_mod = m;
-    const char *e = getenv("DM_DRS"); int lo = 0, hi = 0; if (e) sscanf(e, "%d,%d", &lo, &hi);
-    nxhost_drs_set(lo, hi);   // (also the game's own: its range clamps the controller's own picks)
-}
+
 void probe_install(void) {
     drs_install();
 #if !PLAT_IOS
@@ -541,7 +522,9 @@ void probe_install(void) {
             }
         }
     }
+    if (devtools_on() && !g_slots) g_slots = mmap(NULL, 0x4000, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);   // live probes need the slot page sealed now
     if (g_slots && !g_slots_sealed) { mprotect(g_slots, 0x4000, PROT_READ | PROT_EXEC); plat_icache_invalidate(g_slots, 0x4000); g_slots_sealed = 1; }
     watch_install();
+    devtools_start();
 #endif
 }
