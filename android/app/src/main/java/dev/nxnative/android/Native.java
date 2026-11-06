@@ -114,6 +114,6 @@ final class Native {
 
     /** nxhost_vk_selftest(window, frames): blocks for about frames / 60 s. 0 = passed, -1 = not in this host. */
     static native int selftest(Surface surface, int frames);
-    /** Donkey Kong Bananza's dynamic resolution range while it runs, % of the window (probe.c nxhost_drs_set); 100, 100 = off (the native size) */
-    static native void drsSet(int minPct, int maxPct);
+    /** The frame limit while the game runs (games whose speed follows the measured rate: Prefs.paced); 0 = none */
+    static native void fpsLimitSet(int fps);
 }

@@ -50,6 +50,8 @@ void nxhost_env_changed(void);
 #pragma weak nxhost_picture_place
 #pragma weak nxhost_fps_cap_set
 #pragma weak nxhost_fps_cap_status
+#pragma weak nxhost_fps_limit_set
+void nxhost_fps_limit_set(int fps);   // hle_fpslock.c: the frame limiter, live from the in-game panel
 #pragma weak nxhost_text_input_callback
 
 // ---- Log: the host's stdout and stderr go straight into the log file (nothing is lost when the process dies), and a thread copies new lines to logcat ----
@@ -310,7 +312,4 @@ JNIEXPORT jint JNICALL Java_dev_nxnative_android_Native_selftest(JNIEnv *env, jc
     return r;
 }
 
-// Dynamic resolution, live from the in-game panel (Native.drsSet)
-#pragma weak nxhost_drs_set
-void nxhost_drs_set(int min_pct, int max_pct);   // probe.c: Donkey Kong Bananza's dynamic resolution range, % of the window (0 = the game's own)
-JNIEXPORT void JNICALL Java_dev_nxnative_android_Native_drsSet(JNIEnv *env, jclass cls, jint lo, jint hi) { (void)env; (void)cls; if (nxhost_drs_set) nxhost_drs_set(lo, hi); }
+JNIEXPORT void JNICALL Java_dev_nxnative_android_Native_fpsLimitSet(JNIEnv *env, jclass cls, jint fps) { (void)env; (void)cls; if (nxhost_fps_limit_set) nxhost_fps_limit_set(fps); }

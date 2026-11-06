@@ -434,7 +434,10 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
             GameUpscaler.env(this, id, env);   // the Upscaler (Game settings, the in-game panel): the game's own upscaler and the present's scaling
             if (Prefs.drsGame(id)) { int[] drs = Prefs.DRS[Prefs.drs(this, id)]; env.add("DM_DRS=" + drs[0] + "," + drs[1]); }   // dynamic resolution range (Prefs.DRS)
             int cap = Prefs.fpsCap(this, id);   // the game's own frame rate cap (its in-game panel, its Game settings), else the main screen's (unset: the profile's fps_target)
-            if (cap >= 0) env.add("DM_FPS_TARGET=" + cap);
+            if (Prefs.paced(id)) {   // speed follows the measured rate: presents on the host's own 120 Hz tick, no interval locking, and a frame limit (Prefs.PACE_CAPS)
+                int pace = Prefs.paceCap(this, id);
+                env.add("DM_PRESENT_INTERVAL=display"); env.add("DM_PRESENT_HZ=120"); env.add("DM_FPS_TARGET=0"); env.add("DM_FPS_LIMIT=" + (pace > 0 ? pace : 60));
+            } else if (cap >= 0) env.add("DM_FPS_TARGET=" + cap);
             String gpuNote = GpuDriver.env(this, id, env);   // the game's GPU driver, else the main screen's (DM_VK_DRIVER)
             String ts = Prefs.gpuTs(this, id);   // Game settings › GPU timing; unset: the profile's gpu_timestamps (a DM_NVN_GPU_TS line of env.txt or the game's own lines comes later and wins)
             if (ts != null) env.add("DM_NVN_GPU_TS=" + ts);
