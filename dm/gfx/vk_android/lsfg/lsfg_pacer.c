@@ -17,7 +17,6 @@
 #define PROBE_MARGINAL_GAIN 1.15f
 #define TARGET_SATISFIED_RATIO 0.95f
 #define UNLOADED_BASE_RETENTION 0.75f
-#define DECOUPLED_MIN_BASE_RATE 30.0f
 #define CREDIT_EPSILON 1.0e-4f
 #define MAX_PROBE_FAILURES 4u
 #define STABILIZATION_DURATION 1.0
@@ -52,9 +51,9 @@ static void update_limit(lsfg_pacer *p, double now, float base_rate, float targe
         int throughput_regressed = current_output < previous_output * PROBE_THROUGHPUT_TOLERANCE;
         int collapsed_for_marginal_gain = base_rate < p->probe_base_rate * PROBE_BASE_COLLAPSE_RATIO && current_output < previous_output * PROBE_MARGINAL_GAIN;
         // A base slowed by the generation's own GPU work is a loss where the game locks to 60 / 30 (or would run slower). A decoupled game keeps its speed at any
-        // rate and uses the whole GPU, so any generation slows it: there the probe is kept while the game stays at DECOUPLED_MIN_BASE_RATE or more (its controls
+        // rate and uses the whole GPU, so any generation slows it: there the probe is kept while the game stays at min_base or more (DM_LSFG_MIN_FPS) (its controls
         // answer at the base rate) and shows more frames (the two checks above)
-        int emulation_slowed = p->decoupled ? base_rate < DECOUPLED_MIN_BASE_RATE
+        int emulation_slowed = p->decoupled ? base_rate < p->min_base
                                             : p->unloaded_base_rate > 0 && base_rate < p->unloaded_base_rate * UNLOADED_BASE_RETENTION;
         if (throughput_regressed || collapsed_for_marginal_gain || emulation_slowed) {
             p->limit = p->probe_previous_limit;
@@ -68,7 +67,7 @@ static void update_limit(lsfg_pacer *p, double now, float base_rate, float targe
     }
     // Decoupled: a scene that grows heavier after a probe was kept (a menu at 60 fps, then the level) can push the base under the floor with the generations in place;
     // probes only ever add, so a generation is taken back once the base stayed under it for DEFICIT_DURATION, and the next probe waits as after a failed one
-    if (p->decoupled && p->limit > 0 && base_rate < DECOUPLED_MIN_BASE_RATE) {
+    if (p->decoupled && p->limit > 0 && base_rate < p->min_base) {
         if (!p->below_since) p->below_since = now;
         else if (now - p->below_since >= DEFICIT_DURATION) {
             p->limit--; p->below_since = 0; p->deficit_since = 0; p->output_credit = 0;
