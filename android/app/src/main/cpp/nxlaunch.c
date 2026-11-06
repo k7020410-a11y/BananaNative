@@ -48,6 +48,8 @@ int nxhost_main(int argc, char **argv);
 #pragma weak nxhost_picture_place
 #pragma weak nxhost_fps_cap_set
 #pragma weak nxhost_fps_cap_status
+#pragma weak nxhost_fps_limit_set
+void nxhost_fps_limit_set(int fps);   // hle_fpslock.c: the frame limiter, live from the in-game panel
 #pragma weak nxhost_text_input_callback
 
 // ---- Log: the host's stdout and stderr go straight into the log file (nothing is lost when the process dies), and a thread copies new lines to logcat ----
@@ -306,3 +308,5 @@ JNIEXPORT jint JNICALL Java_dev_nxnative_android_Native_selftest(JNIEnv *env, jc
     if (w) ANativeWindow_release(w);   // the replay holds its own reference
     return r;
 }
+
+JNIEXPORT void JNICALL Java_dev_nxnative_android_Native_fpsLimitSet(JNIEnv *env, jclass cls, jint fps) { (void)env; (void)cls; if (nxhost_fps_limit_set) nxhost_fps_limit_set(fps); }
