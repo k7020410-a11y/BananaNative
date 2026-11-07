@@ -24,6 +24,8 @@ int nxhost_main(int argc, char **argv);
 // ---- The host's launcher interface: the headers are the host's own, so a signature change there fails here at compile time; every entry point is weak ----
 #include "input_android.h"
 #include "vk_android.h"
+#pragma weak nxhost_env_changed
+void nxhost_env_changed(void);
 #pragma weak nxhost_set_window
 #pragma weak nxhost_vk_selftest
 #pragma weak nxhost_input_device_added
@@ -165,6 +167,7 @@ JNIEXPORT jint JNICALL Java_dev_nxnative_android_Native_start(JNIEnv *env, jclas
         if (eq) { *eq = 0; setenv(kv, eq + 1, 1); fprintf(stderr, "[nxlaunch] env %s=%s\n", kv, eq + 1); }
         free(kv);
     }
+    if (nxhost_env_changed) nxhost_env_changed();   // the replay's cached switches read the environment again (some were read before it, with the window)
     char *wd = jstr(env, cwd); if (chdir(wd)) fprintf(stderr, "[nxlaunch] chdir %s: %s\n", wd, strerror(errno)); free(wd);
     g_run.argc = (*env)->GetArrayLength(env, args);
     g_run.argv = calloc((size_t)g_run.argc + 1, sizeof *g_run.argv);
@@ -306,3 +309,8 @@ JNIEXPORT jint JNICALL Java_dev_nxnative_android_Native_selftest(JNIEnv *env, jc
     if (w) ANativeWindow_release(w);   // the replay holds its own reference
     return r;
 }
+
+// Dynamic resolution, live from the in-game panel (Native.drsSet)
+#pragma weak nxhost_drs_set
+void nxhost_drs_set(int min_pct, int max_pct);   // probe.c: Donkey Kong Bananza's dynamic resolution range, % of the window (0 = the game's own)
+JNIEXPORT void JNICALL Java_dev_nxnative_android_Native_drsSet(JNIEnv *env, jclass cls, jint lo, jint hi) { (void)env; (void)cls; if (nxhost_drs_set) nxhost_drs_set(lo, hi); }
