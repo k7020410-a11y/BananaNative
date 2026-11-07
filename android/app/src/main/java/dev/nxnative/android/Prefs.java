@@ -73,6 +73,11 @@ final class Prefs {
     static String paceLabel(int v) { return (v <= 0 ? 60 : v) + " fps"; }   // 0 is 60: the game's own fastest rate, where the decoupling's rate is clamped
     /** A paced game's cap as saved, without capOf (which turns 45 and 40 into 30 for the other games): its own, else the default, as one of PACE_CAPS */
     static int paceCap(Context c, String titleId) { return paceOf(of(c).getInt(gameKey("fps_cap", titleId), of(c).getInt("fps_cap", -1))); }
+    /** Use fast cores (Native.pinThreads): the main screen's default (on), then each game's own */
+    static boolean pinThreads(Context c) { return of(c).getBoolean("pin_threads", true); }
+    static void pinThreadsDefault(Context c, boolean on) { of(c).edit().putBoolean("pin_threads", on).commit(); }
+    static boolean pinThreads(Context c, String titleId) { return of(c).getBoolean(gameKey("pin_threads", titleId), pinThreads(c)); }
+    static void pinThreads(Context c, String titleId, boolean on) { of(c).edit().putBoolean(gameKey("pin_threads", titleId), on).commit(); }
 
     /** The game's window size: its own choice, else the default (defaultWindow) */
     static String gameWindow(Context c, String titleId) { return of(c).getString(gameKey("window", titleId), defaultWindow(c, titleId)); }

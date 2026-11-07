@@ -165,6 +165,8 @@ public final class MainActivity extends Activity {
         drsRow = new Ui.Setting(this, "📐", "Dynamic resolution", v -> DrsSlider.dialog(this, "", Prefs.drs(this), null, true, w -> Prefs.drsDefault(this, w),
                 this::refreshSettings)).chevron(this);
         play.addView(drsRow.view);
+        play.addView(new Ui.Setting(this, "🚀", "Use fast cores", null).toggle(this, Prefs.pinThreads(this), (b, on) -> Prefs.pinThreadsDefault(this, on))
+                .value("Keeps the busiest threads off the small cores").view);
         lsfgRow = new Ui.Setting(this, "✨", "Frame generation", v -> frameGen()).chevron(this);
         play.addView(lsfgRow.view);
         TextView hint = Ui.small(this, "A game's own settings (⋯ on its card) override these.");

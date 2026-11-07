@@ -179,6 +179,18 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
     private boolean overlayOn() { return overlayEnv != null ? overlayEnv : Prefs.overlay(this); }
 
     /** The overlay, twice a second: top right the frame rate and the other items that are on (Overlay); nothing is read while it is off */
+    /** Thread placement (Native.pinThreads): every 5 s, for threads the game and the replay start later; stops when the phone reports no clocks */
+    private final Runnable pinRun = this::pinTick;
+    private void pinTick() {
+        if (Native.pinThreads() < 0) return;
+        ui.postDelayed(pinRun, 5000);
+    }
+    /** At the start and when a recreated screen attaches to the running game (attach: the old screen's loops were stopped); one loop, never two */
+    private void pinStart() {
+        ui.removeCallbacks(pinRun);
+        if (Prefs.pinThreads(this, titleId())) ui.postDelayed(pinRun, 2000);
+    }
+
     private void fpsTick() {
         if (stopped || paused) { ui.postDelayed(this::fpsTick, 2000); return; }   // nothing to show: no readings (thermal, battery, the host's counters) while suspended
         boolean on = overlayOn();
@@ -443,6 +455,7 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
             if (ts != null) env.add("DM_NVN_GPU_TS=" + ts);
             if (Prefs.instancedDraws(this, id)) env.add("DM_VK_INSTANCE=1");   // Game settings › Instanced draws
             if (Prefs.classicPasses(this, id)) env.add("DM_VK_CLASSIC_RP=1");   // Game settings › Classic render passes
+            pinStart();   // Use fast cores (Game settings, Settings)
             env.addAll(user);
             for (String kv : env) if (kv.startsWith("DM_OVERLAY=")) overlayEnv = !kv.substring(11).trim().equals("0");
             String[] args = {"nxhost", packDir.getPath()};
@@ -500,6 +513,7 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
         // Pause-on-return only after a real trip to the background: a screen recreated while it showed (a wallpaper colour or theme change) does not pause the game
         if (hostPaused == 1 || hostInBackground && Prefs.pauseOnReturn(this, titleId())) { paused = true; Native.lifecycle(4); pausedView.setVisibility(View.VISIBLE); }
         ui.postDelayed(this::fpsTick, 500);
+        pinStart();
     }
 
     /** The game's screen was stopped (the game in the background) and not started again; a stop for a configuration change is no trip to the background */
