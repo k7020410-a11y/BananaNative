@@ -440,6 +440,7 @@ public final class PackService extends Service {
         PackEngine.setenv("NX_PACK_JOBS", String.valueOf(workers));
         PackEngine.setenv("J", s.equals("split") ? "1" : String.valueOf(workers));   // the split's J is its process pool: 1 = in this process
         PackEngine.setenv("DM_SPLIT_RESUME", splitScan.getPath());   // the split's kept scan results (only shader_split.py reads it)
+        PackEngine.setenv("DM_SPLIT_SELECTED", s.equals("split") ? "1" : "0");   // package selected payloads only; still scan every shader for the complete map
         PackEngine.setenv("DM_PACKER_COMMIT", BuildConfig.NX_COMMIT);   // pack.tsv's packer: no repository on the phone to ask
         PackEngine.setenv("NX_PACK_WORK", od.getPath());
         PackEngine.setenv("NX_PACK_VERSION", v);

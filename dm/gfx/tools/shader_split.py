@@ -56,8 +56,9 @@
 #   A RomFS or main may be in a NUP file (android/NUP.md): `game.nup:update/458752/romfs` and `game.nup:update/458752/exefs/main`, read in place through romfs.py; a RomFS given
 #   as `game.nup` or `game.nup:<selector>` is that package's romfs (the highest update's, else the base's, for a bare file)
 #   Environment DM_SPLIT_RESUME=<dir>: the scan resumes by file (ScanCache): a split stopped part way (the phone's thermal or battery pauses, a kill, a reboot) scans again only the files it had not finished
+#   Environment DM_SPLIT_SELECTED=1: keep the complete shader map but only selected IDRK payloads in the package (Android's selected-shader build)
 # Pair table: (vertex key, pixel key) of every BNSH variation (every Unity program); dmsh_build uses it to give vertex shaders the outputs their pixel shaders read but they do not write (see dmsh_build.py vs_pad)
-import base64, collections, concurrent.futures as cf, hashlib, json, os, pickle, re, struct, subprocess, sys, time, zlib
+import base64, collections, concurrent.futures as cf, hashlib, json, os, pickle, re, struct, subprocess, sys, tempfile, time, zlib
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../tools'))
 from romfs import os, open, is_image
 import nup
@@ -67,6 +68,24 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__))); import uepak
 GAME = _game.load()   # the current game profile (DM_GAME, required): source group rules and the table header note
 GROUPS, NOTE = GAME.pairs('shader_groups'), GAME.get('shader_note')
 KEY_SKIP = tuple(int(x, 0) for x in GAME.get('shader_key_skip', '0+0').split('+'))   # control bytes the keys hash as zeros (key_ctl); dm/games/game.py checks the form
+
+def split_selection():
+    """The Android pack's selected shader payloads, plus their paired pixel shaders; None means keep every shader as desktop splits do"""
+    if os.environ.get('DM_SPLIT_SELECTED') != '1': return None
+    selected, path = set(), GAME.table('shader_seen.tsv')
+    if os.path.exists(path):
+        for line in open(path):
+            fields = line.split()
+            if fields and re.fullmatch(r'[0-9a-f]{16}', fields[0]): selected.add(fields[0])
+    for name in ('shader_pairs.tsv', 'pso_pairs.tsv'):
+        path = GAME.table(name)
+        if not os.path.exists(path): continue
+        for line in open(path):
+            fields = line.split()
+            if len(fields) >= 2 and fields[0] in selected and re.fullmatch(r'[0-9a-f]{16}', fields[1]): selected.add(fields[1])
+    return selected
+
+SPLIT_SELECTED = split_selection()
 # The sources are what the game files hold, with no profile switch: GLSLC outputs in main (glslc_shaders), the outputs the game compiles at run time when a capture is there (DM_GLSLC_CAPTURE,
 # hle_glslc.c), the shader code archives of Unreal paks once decoded on the Mac (uepak.py, DM_OODLE_JOB, hle_oodle.c), the NSP script deciding from the files which of these two to make; and shaders the
 # host saved when the map did not have them (DM_NVN_SHDUMP, read from <version dir>/nvn_shdump or DM_NVN_SHDUMP_DIR: nvn_dumps)
@@ -355,7 +374,7 @@ def glslc_program(d, h, size, label):
     if len(secs) < 2 or len(set(sts)) < len(sts) or any(not st or check(label, st, ctl, code) for st, (ctl, code) in zip(sts, secs)): return []
     return [(f'{label}#GLSLC@{h:#x}#var', st, ctl, code) for st, (ctl, code) in zip(sts, secs)]
 
-def glslc_shaders(d, label, need=True, skip=()):
+def glslc_shaders(d, label, need=True, skip=(), selected=None, metadata=None):
     """GLSLC compiler outputs (838 in 13 Sentinels' main read-only segment, one stage each): from the magic 0x19866891, +0x44 = the whole output's length; an output of one stage holds exactly one control section with the code area right after it (control +0x20 = control length),
     one of several stages is read by its section headers (glslc_program).
     The magic is only 4 bytes, so only outputs that pass the triple check are kept. Every game's main is searched: Unity's player has 11 of its own (Fire Emblem Engage, Ace Attorney Investigations
@@ -365,6 +384,11 @@ def glslc_shaders(d, label, need=True, skip=()):
     start at code +0 (the first word is a scheduling word), and the stage then comes from the control's thread group (+0x748), which only compute sections fill. Its few version-0x1d.0 outputs keep
     something else at control +0x20 (odd values such as 0x136b), so a length that is not a multiple of 4 is not a control length"""
     out = []
+    def add(shader):
+        where, st, ctl, code = shader
+        key = skey(ctl, code)
+        if metadata is not None: metadata.setdefault(key, (where, st))
+        if selected is None or key in selected: out.append(shader)
     for m in re.finditer(b'\x91\x68\x86\x19', d):
         if any(a <= m.start() < b for a, b in skip): continue
         if m.start() + 0x48 > len(d): continue
@@ -372,13 +396,15 @@ def glslc_shaders(d, label, need=True, skip=()):
         if first == 0xa8:   # NVN2: its section headers say everything; its control sections are too short for the rule below
             if not 0 < size <= len(d) - h: continue
             secs = glslc_section(d, h, size) or []
-            if len(secs) > 1: out += glslc_program(d, h, size, label)
-            elif secs and (st := glslc_stage(*secs[0])) and not check(label, st, *secs[0]): out.append((f'{label}#GLSLC@{h:#x}', st, *secs[0]))
+            if len(secs) > 1:
+                for shader in glslc_program(d, h, size, label): add(shader)
+            elif secs and (st := glslc_stage(*secs[0])) and not check(label, st, *secs[0]): add((f'{label}#GLSLC@{h:#x}', st, *secs[0]))
             continue
         c = d.find(CTL_MAGIC, h, h + size) if 0x760 < size <= len(d) - h else -1
         if c < 0: continue
         if d.find(CTL_MAGIC, c + 4, h + size) >= 0:
-            out += glslc_program(d, h, size, label); continue
+            for shader in glslc_program(d, h, size, label): add(shader)
+            continue
         nctl, ncode = (struct.unpack_from('<I', d, c + 0x20)[0], struct.unpack_from('<I', d, c + 0x704)[0]) if c + 0x708 <= h + size else (0, 0)   # 0: a control section the output does not hold
         ctl, code = d[c:c + nctl], d[c + nctl:c + nctl + ncode]
         st = glslc_stage(ctl, code) if nctl >= 0x760 and not nctl & 3 and c + nctl + ncode <= h + size else None
@@ -390,7 +416,7 @@ def glslc_shaders(d, label, need=True, skip=()):
             if not sec or len(sec) != 1: continue
             (ctl, code), = sec; st = glslc_stage(ctl, code)
             if not st or check(label, st, ctl, code): continue
-        out.append((f'{label}#GLSLC@{h:#x}', st, ctl, code))
+        add((f'{label}#GLSLC@{h:#x}', st, ctl, code))
     if not out and need: red(f'{label}: no GLSLC output')
     return out
 
@@ -498,15 +524,21 @@ def idrk_entries(d):
         yield o + esz - csz, o + esz, struct.unpack_from('<I', d, o + 0x2c)[0]
         o += esz
 
-def idrk_data(d, a, b, flags, head=None):
+def idrk_data(d, a, b, flags, head=None, sink=None):
     """An entry's data. Flag 0x100000 alone = zlib in chunks (Age of Calamity): u32 stored length + a zlib stream each, a zero length ends; the chunks inflate to at most 16 KB.
     Flag 0x400000 = chunks of another form (ROMANCE OF THE THREE KINGDOMS 8 REMAKE): u16 stored length, 8 bytes that the reader does not need, the stream; a zero length ends, and each chunk
     inflates to at most 16 KB (0x4000, which LZ4 is given as the most). The streams are LZ4 blocks when 0x100000 is set too, zlib otherwise: of that game's 51,655 entries, 49,620 have flags
     0x500000, 2,026 have 0x400000 and 9 are stored (0); all of them inflate to the length in their header. Anything else is stored. head: only the first bytes"""
     import zlib
     new, lz4b = flags & 0x400000, flags & 0x500000 == 0x500000
-    if not flags & 0x500000: return d[a:min(b, a + head) if head else b]
-    out = []
+    if not flags & 0x500000:
+        end = min(b, a + head) if head else b
+        if sink is None: return d[a:end]
+        while a < end:
+            next_a = min(end, a + 0x100000)
+            sink.write(d[a:next_a]); a = next_a
+        return None
+    out = [] if sink is None else None
     while a + 4 <= b:
         if new: cs = struct.unpack_from('<H', d, a)[0]; a += 10
         else: cs = struct.unpack_from('<I', d, a)[0]; a += 4
@@ -517,18 +549,28 @@ def idrk_data(d, a, b, flags, head=None):
             if head: return r[:head]
         elif head: return zlib.decompressobj().decompress(d[a:a + min(cs, 1024)], head)
         else: r = zlib.decompress(d[a:a + cs])
-        out.append(r); a += cs
-    return b''.join(out)
+        if sink is None: out.append(r)
+        else: sink.write(r)
+        a += cs
+    return b''.join(out) if sink is None else None
 
-def idrk_shaders(path, label, out):
+def idrk_shaders(path, label, out, selected=None, metadata=None):
     """Koei Tecmo's KTGL keeps its shaders in G2S containers ('_S2G3000', type KTID 0x7bcd279f in Age of Calamity: 23,108 entries in three RDB files, 2.3 GB inflated), each a material's variations
     as GLSLC compiler outputs (glslc_shaders). One '_DOK0000' container (type KTID 0x20a6a0bb, the engine's system resources; once in system.rdb.bin and once in the update's .bin1) holds 151 bare
     GLSLC outputs without a G2S wrapper, among them 21 shaders the first battle draws. No other entry type holds any. The RDB files are up to 3.8 GB, so they are mapped rather than read,
-    and only entries whose data starts with one of those two magics are inflated"""
+    and only entries whose data starts with one of those two magics are inflated. Large entries are streamed to a temporary file and scanned through a mapping, not joined in memory."""
     from romfs import mmap
     with open(path, 'rb') as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as d:
-        for a, b, flags in idrk_entries(d):
-            if idrk_data(d, a, b, flags, 4) in (b'_S2G', b'_DOK'): out.extend(glslc_shaders(idrk_data(d, a, b, flags), f'{label}#IDRK@{a:#x}', need=False))
+        with tempfile.TemporaryFile() as expanded:
+            for a, b, flags in idrk_entries(d):
+                if idrk_data(d, a, b, flags, 4) not in (b'_S2G', b'_DOK'): continue
+                expanded.seek(0); expanded.truncate()
+                idrk_data(d, a, b, flags, sink=expanded)
+                size = expanded.tell()
+                if not size: continue
+                expanded.flush()
+                with mmap.mmap(expanded.fileno(), size, access=mmap.ACCESS_READ) as decoded:
+                    out.extend(glslc_shaders(decoded, f'{label}#IDRK@{a:#x}', need=False, selected=selected, metadata=metadata))
 
 G2S, SPKG = b'_S2G3000', b'SPKG'
 def kt_gz(d):
@@ -2586,7 +2628,7 @@ def mesh_facts(key, st, ctl, code, keys, mesh_pairs):
     layout = [maxv, maxp, payload, *planes]
     flats, reads = set(), set()
     for ps in pairs:
-        pcode = keys[ps][3] if ps in keys else b''
+        pcode = (keys[ps][3] or b'') if ps in keys else b''
         if len(pcode) < 0x38: continue
         imap = [(pcode[0x18 + i // 4] >> (i % 4 * 2)) & 3 for i in range(128)]
         flats.add(tuple(4 + i for i in range(128) if imap[i] == 1 and 4 + i not in planes))
@@ -2640,8 +2682,16 @@ def scan_file_in(args):
         nlg_shaders(path, '/' + rel, found)
         return rel, uniq_keys(found), var_pairs(found), trees
     if head[:8] in (IDRK, PDRK):
-        idrk_shaders(path, '/' + rel, found)
-        return rel, uniq_keys(found), var_pairs(found), trees
+        if SPLIT_SELECTED is None:
+            idrk_shaders(path, '/' + rel, found)
+            return rel, uniq_keys(found), var_pairs(found), trees
+        metadata = {}
+        idrk_shaders(path, '/' + rel, found, selected=SPLIT_SELECTED, metadata=metadata)
+        uniq = {key: (where, stage, None, None) for key, (where, stage) in metadata.items()}
+        for where, stage, ctl, code in found:
+            key = skey(ctl, code)
+            if uniq[key][2] is None: uniq[key] = (uniq[key][0], uniq[key][1], ctl, code)
+        return rel, uniq, var_pairs(found), trees
     if len(args) > 2 and head[:8] == ONEPACK:   # a range of Trinity packs (trpfs_jobs)
         trinity_shaders(path, rel, args[2], found)
         return rel, uniq_keys(found), var_pairs(found), trees
@@ -2883,13 +2933,15 @@ def digest_sources():
         if os.path.isdir(d): out += [os.path.join(d, f) for f in sorted(os.listdir(d)) if f.endswith('.py')]
     prof = str(GAME.dir)
     out += [os.path.join(prof, f) for f in sorted(os.listdir(prof)) if f == 'game.tsv' or f.endswith('.py')]
+    if SPLIT_SELECTED is not None:
+        out += [str(GAME.table(f)) for f in ('shader_seen.tsv', 'shader_pairs.tsv', 'pso_pairs.tsv') if GAME.table(f).is_file()]
     return out
 
 def scan_digest(argv, jobs, sources=None):
     """ScanCache's digest: the split's arguments and environment (with DM_PACKER_COMMIT, the app's commit on the phone), every job (with its file's size and
     modification time) and the content of the tools and the profile (digest_sources)"""
     h = hashlib.sha256()
-    h.update(repr((argv, [os.environ.get(k) for k in ('DM_GAME', 'DM_GLSLC_CAPTURE', 'DM_UE_SHADERS', 'DM_PACKER_COMMIT')])).encode())
+    h.update(repr((argv, [os.environ.get(k) for k in ('DM_GAME', 'DM_GLSLC_CAPTURE', 'DM_UE_SHADERS', 'DM_PACKER_COMMIT', 'DM_SPLIT_SELECTED')])).encode())
     for j in jobs:
         try: st = os.stat(j[0]); t = (st.st_size, st.st_mtime_ns)
         except OSError: t = None
@@ -3018,24 +3070,30 @@ def main():
         pairs |= pr
         for key, v in uniq.items():
             if key in keys:
-                if not same_shader(keys[key][2:4], v[2:4]): red(f'key {key} is the same but the control section or code area differs ({v[0]} / {keys[key][0]})')
+                previous = keys[key]
+                if previous[2] is not None and v[2] is not None and not same_shader(previous[2:4], v[2:4]): red(f'key {key} is the same but the control section or code area differs ({v[0]} / {previous[0]})')
+                if previous[2] is None and v[2] is not None: keys[key] = (previous[0], previous[1], v[2], v[3])
                 continue
             keys[key] = v; per_src[group(v[0])] += 1
     mesh_pairs = {x for x in pairs if x[2:] in (('mesh',), ('task',))}; pairs -= mesh_pairs
     prog = {(a, b) for a, b, *t in pairs if t} - pairs; pairs = {x for x in pairs if len(x) == 2}
-    sp, cover = separable_pairs(keys); pairs |= sp
+    pair_keys = keys if SPLIT_SELECTED is None else {key: value for key, value in keys.items() if value[2] is not None}
+    sp, cover = separable_pairs(pair_keys); pairs |= sp
     if cover: print(f'single-stage programs: {len({v for v, _ in sp}):,} vertex shaders are paired with a cover of {len(cover)} pixel shader(s) ({" ".join(cover)})')
     os.makedirs(pkg, exist_ok=True)
     for f in os.listdir(pkg):
         if f.endswith('.bin'): os.unlink(os.path.join(pkg, f))
-    recs = collections.defaultdict(list); rows = []; facts = {}; stat = collections.Counter()
+    recs = collections.defaultdict(list); rows = []; facts = {}; stat = collections.Counter(); map_indices = collections.Counter()
     for key in sorted(keys, key=lambda k: (group(keys[k][0]), keys[k][0], k)):   # the same input gives byte-identical output
         where, st, ctl, code = keys[key]
         name = f'{st}_{group(where)}.bin'
+        index = map_indices[name]; map_indices[name] += 1
+        rows.append((name, index, STAGE_NAME[st], key, where)); stat[st] += 1
+        if ctl is None or code is None: continue
         rec = bytearray(b'BTCDBTCD' + bytes(0x30)); struct.pack_into('<2I', rec, 0x28, len(ctl), len(code)); rec += code + ctl
         if rec.find(CTL_MAGIC) != 0x38 + len(code): red(f'key {key}: the control magic appears in the code area, dmsh_build would split the record wrongly')
         if rec.count(b'BTCDBTCD') != 1: red(f'key {key}: the record separator appears inside the record')
-        rows.append((name, len(recs[name]), STAGE_NAME[st], key, where)); recs[name].append(bytes(rec)); stat[st] += 1
+        recs[name].append(bytes(rec))
         if st == 'cs':
             # NVN2: the thread group at +0x58 (32 1 1 in Donkey Kong Bananza's effects); shared memory taken from +0x64, not yet seen nonzero (unverified)
             at = (0x58, 0x64) if nvn2_ctl(ctl) else (0x748, 0x754)

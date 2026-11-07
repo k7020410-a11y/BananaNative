@@ -39,6 +39,12 @@ static class SwshXlate
     // texture array from a buffer, BindlessToArray: the index is the handle's byte offset ÷ 8) has one element per word, so any word the shader computes is in it
     const int C2HandleWords = (SampBase + 8 * 128) / 8;
 
+    static int JobInt(JsonNode node)
+    {
+        if (node is JsonValue value && value.TryGetValue<JsonElement>(out var element)) return element.GetInt32();
+        return node.GetValue<int>();
+    }
+
     sealed class Accessor : IGpuAccessor
     {
         readonly byte[] _code; readonly JsonObject _job; int _binding = 1; public readonly List<string> Notes = new();
@@ -75,10 +81,10 @@ static class SwshXlate
         }
         // c1 constant segment (the 0x100 bytes before the control segment in the shader package): the jump table of indirect jump BRX lives here (LDC c[1]); without it the translator cannot resolve jump targets and control flow goes wrong (particle shaders loop forever)
         public int QueryConstantBuffer1Size() => _c1.Length;
-        public int[] QueryAmpereComputeC0Layout() => _job["nvn2_cs"] is JsonArray l ? l.Select(v => (int)v).ToArray() : null;
+        public int[] QueryAmpereComputeC0Layout() => _job["nvn2_cs"] is JsonArray l ? l.Select(JobInt).ToArray() : null;
         // A task / mesh program's layout (job "mesh", see the file header) and its GL depth constant
-        public int[] QueryMeshShaderLayout() => _job["mesh"] is JsonArray m ? m.Select(v => (int)v).ToArray() : null;
-        public int QueryMeshShaderGlDepthSpecId() => _job["gl_depth_spec"] is JsonNode n ? (int)n : -1;
+        public int[] QueryMeshShaderLayout() => _job["mesh"] is JsonArray m ? m.Select(JobInt).ToArray() : null;
+        public int QueryMeshShaderGlDepthSpecId() => _job["gl_depth_spec"] is JsonNode n ? JobInt(n) : -1;
         public uint ConstantBuffer1Read(int offset) { if (offset >= 0 && offset + 4 <= _c1.Length) return BitConverter.ToUInt32(_c1, offset); Notes.Add($"c1 read out of bounds +{offset:X} (c1 length {_c1.Length})"); return 0; }
         // All resources go into set 0, each with a distinct binding number (spirv-cross emits them as one argument buffer); the translator's convention of giving the buffer of constant segment number index binding = index+1 is not relied on
         // The translator's own messages (a bindless read it resolved, or could not and removed, its result 0; an invalid encoding) go into the notes, marked, which dmsh_build.py counts apart
@@ -148,11 +154,11 @@ static class SwshXlate
             if (f == null) { Notes.Add($"image handle {handle:X} slot {slot} has no format in the answer table, using R8G8B8A8Unorm"); return TextureFormat.R8G8B8A8Unorm; }
             return Enum.TryParse(f, true, out TextureFormat tf) ? tf : TextureFormat.R8G8B8A8Unorm;
         }
-        int Local(int i) => _job["local"] is JsonArray a && a.Count > i ? (int)a[i] : 1;
+        int Local(int i) => _job["local"] is JsonArray a && a.Count > i ? JobInt(a[i]) : 1;
         public int QueryComputeLocalSizeX() => Local(0);
         public int QueryComputeLocalSizeY() => Local(1);
         public int QueryComputeLocalSizeZ() => Local(2);
-        public int QueryComputeSharedMemorySize() => _job["shared"] is JsonNode n ? (int)n : 0;   // the shared memory size in the compute shader's control section (shader_split.py)
+        public int QueryComputeSharedMemorySize() => _job["shared"] is JsonNode n ? JobInt(n) : 0;   // the shared memory size in the compute shader's control section (shader_split.py)
         static AttributeType Attr(string s) => s switch { "sint" => AttributeType.Sint, "uint" => AttributeType.Uint, _ => AttributeType.Float };
         public bool QueryGeometryInputFixed() => _job["geometry_topology"] != null;
         // Compute lowering must emit passthrough vertices explicitly: Metal
@@ -163,25 +169,25 @@ static class SwshXlate
         // Job subgroup_size: the device's fixed subgroup size (Adreno: 64). Maxwell code assumes 32-lane warps; with 64 Ryujinx splits ballots, masks and shuffles into 32-lane halves (InstEmitWarp, HelperFunctionManager)
         // Job shared_max: the device's maxComputeSharedMemorySize (DMSH_VK_SHARED_MAX). A compute program declaring more keeps its shared memory in a storage buffer, a slice per
         // workgroup (Ryujinx StructuredIr/SharedSpillInfo.cs); unset, no limit (Apple: dmsh_build.py shared_spill moves threadgroup arrays in the Metal source instead)
-        public int QueryHostComputeSharedMemoryMax() => _job["shared_max"] is JsonNode sm ? (int)sm : 0;
+        public int QueryHostComputeSharedMemoryMax() => _job["shared_max"] is JsonNode sm ? JobInt(sm) : 0;
         public (int Slice, int Workgroup)? SharedSpill;   // the res.json's "shared_spill": {"bytes": a workgroup's slice, "workgroup": bytes left in workgroup memory}
         public void RecordSharedSpill(int sliceBytes, int workgroupBytes) => SharedSpill = (sliceBytes, workgroupBytes);
-        public int QueryHostSubgroupSize() => _job["subgroup_size"] is JsonNode sg ? (int)sg : 32;
+        public int QueryHostSubgroupSize() => _job["subgroup_size"] is JsonNode sg ? JobInt(sg) : 32;
         // Job "gather_bias" (the Android build, vk_android_build.py gather_bias: 8 on an Adreno): bits of the host's gather coordinate precision; the translator moves gather
         // coordinates by 1 / (size x 2^(bits + 1)) off the texel edge, where Adreno rounds to the neighbouring footprint. 0 (the Apple jobs, other GPUs): none
-        public int QueryHostGatherBiasPrecision() => _job["gather_bias"] is JsonNode gb ? (int)gb : 0;
+        public int QueryHostGatherBiasPrecision() => _job["gather_bias"] is JsonNode gb ? JobInt(gb) : 0;
         // Job ssbo_align: the device's storage buffer offset alignment. Set, the host binds each storage buffer at its address rounded down to it, and the shader adds the
         // difference (GlobalToStorage: offset = address − (base & −align)); unset, a storage buffer starts exactly at its c0 address
         public bool QueryHasUnalignedStorageBuffer() => _job["ssbo_align"] != null;
         public bool QueryHasConstantBufferDrawParameters() => _job["ssbo_align"] != null;   // Android Vulkan: c0 + 0x644 reads BaseInstance, which holds an indirect draw's (Metal: dmsh_build.py vs_base_instance)
-        public int QueryHostStorageBufferOffsetAlignment() => _job["ssbo_align"] is JsonNode al ? (int)al : 16;
+        public int QueryHostStorageBufferOffsetAlignment() => _job["ssbo_align"] is JsonNode al ? JobInt(al) : 16;
         public GpuGraphicsState QueryGraphicsState()
         {
             Array32<AttributeType> attr = default; Array8<AttributeType> fout = default;
             if (_job["attr"] is JsonObject a) foreach (var kv in a) attr[int.Parse(kv.Key)] = Attr((string)kv.Value);
             if (_job["fout"] is JsonObject f) foreach (var kv in f) fout[int.Parse(kv.Key)] = Attr((string)kv.Value);
             bool earlyZ = _job["early_fragment_tests"] is JsonNode ez && (bool)ez;   // control +0x718 (dmsh_build.py job_for): [[early_fragment_tests]] in the MSL
-            return new GpuGraphicsState(earlyZ, _job["geometry_topology"] is JsonNode gt ? (InputTopology)(int)gt : InputTopology.Triangles, false, TessPatchType.Triangles, TessSpacing.EqualSpacing,
+            return new GpuGraphicsState(earlyZ, _job["geometry_topology"] is JsonNode gt ? (InputTopology)JobInt(gt) : InputTopology.Triangles, false, TessPatchType.Triangles, TessSpacing.EqualSpacing,
                 false, false, false, false /* depth not rewritten: dmsh_build.py adds the GL entry point (see the file header) */, false, 1f, AlphaTestOp.Always, 0f, attr, false, fout, false,
                 false /* no Y flip */, true /* origin upper-left */, false);
         }
@@ -273,13 +279,13 @@ static class SwshXlate
                     ["geometry_stride"] = geometry ? ctx.GetResourceReservations().OutputSizePerInvocation : 0,
                     ["uses_frag_coord"] = p.Info.UsesFragCoord, ["frag_out_map"] = p.Info.FragmentOutputMap,
                 };
-                if ((string)job["stage"] == "ms") res["mesh"] = MeshOutputs(job["mesh"].AsArray().Select(v => (int)v).ToArray());
-                foreach (var b in p.Info.CBuffers) res["cbufs"].AsArray().Add(new JsonObject { ["binding"] = b.Binding, ["slot"] = b.Slot });
-                foreach (var b in p.Info.SBuffers) res["sbufs"].AsArray().Add(new JsonObject { ["binding"] = b.Binding, ["slot"] = b.Slot, ["cb_slot"] = b.SbCbSlot, ["cb_offset"] = b.SbCbOffset, ["flags"] = (int)b.Flags });
+                if ((string)job["stage"] == "ms") res["mesh"] = MeshOutputs(job["mesh"].AsArray().Select(JobInt).ToArray());
+                foreach (var b in p.Info.CBuffers) res["cbufs"].AsArray().Add((JsonNode)new JsonObject { ["binding"] = b.Binding, ["slot"] = b.Slot });
+                foreach (var b in p.Info.SBuffers) res["sbufs"].AsArray().Add((JsonNode)new JsonObject { ["binding"] = b.Binding, ["slot"] = b.Slot, ["cb_slot"] = b.SbCbSlot, ["cb_offset"] = b.SbCbOffset, ["flags"] = (int)b.Flags });
                 foreach (var (list, name) in new[] { (p.Info.Textures, "textures"), (p.Info.Images, "images") })
-                    foreach (var t in list) res[name].AsArray().Add(new JsonObject { ["binding"] = t.Binding, ["type"] = (int)t.Type, ["format"] = t.Format.ToString(), ["cbuf_slot"] = t.CbufSlot, ["handle"] = t.HandleIndex, ["array"] = t.ArrayLength, ["separate"] = t.Separate, ["flags"] = (int)t.Flags });
+                    foreach (var t in list) res[name].AsArray().Add((JsonNode)new JsonObject { ["binding"] = t.Binding, ["type"] = (int)t.Type, ["format"] = t.Format.ToString(), ["cbuf_slot"] = t.CbufSlot, ["handle"] = t.HandleIndex, ["array"] = t.ArrayLength, ["separate"] = t.Separate, ["flags"] = (int)t.Flags });
                 if (acc.SharedSpill is (int slice, int wg)) res["shared_spill"] = new JsonObject { ["bytes"] = slice, ["workgroup"] = wg };
-                if (acc.Fetch1D.Count > 0) { var f1 = new JsonArray(); foreach (int h in acc.Fetch1D) f1.Add(h); res["fetch1d"] = f1; }
+                if (acc.Fetch1D.Count > 0) { var f1 = new JsonArray(); foreach (int h in acc.Fetch1D) f1.Add((JsonNode)h); res["fetch1d"] = f1; }
                 File.WriteAllText(Path.Combine(outDir, key + ".res.json"), res.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
                 ok++;
             }

@@ -65,6 +65,7 @@ The first boot shows the language list: `A`, `LUp`, `A` picks English. The chara
 - Only the first area has been played on this build. A new save written through the game has not been checked: the 31-minute playtest wrote none.
 - An IPA has not been built. A full iOS shader build would be needed first.
 - Android (2026-11-05, the test app at `f9b4b6f1`, the selected library `v-31b81e5c07ac`): plays at about 60 fps on the Qualcomm driver and Turnip; the user's run got past the Poké Ball and through a text prompt (the keyboard dialog). Current, open: **the sky is black** on Android. Not investigated: no log was taken. Another emulator's report names three fullscreen pixel shaders (a guarded ULEA, a UISETP with OR and the output predicate as accumulator) that its own lowering rejected; this translator decodes both forms (`InstEmitAmpereAlu.cs`, `AIsetp`) and the selected library built with no failures, so the cause here is not known.
+- Retroid Pocket 6 (2026-11-07, Turnip T30): the library contained 4,773 shaders; runtime requested keys recorded in `shader_seen.tsv` but absent from the library, and Prepare's log reported 3,384 `System.Text.Json` NativeAOT metadata failures out of 8,157 requested shaders. The translator's integer JsonNode reads / generic JsonArray additions are fixed; the new APK is installed and shader preparation/playback verification is pending.
 
 ## Found on this game
 
@@ -73,6 +74,8 @@ The first boot shows the language list: `A`, `LUp`, `A` picks English. The chara
 - [A log line inside a placed-memory swap stops every thread](../../../docs/reference/memory.md#a-log-line-inside-a-placed-memory-swap-stops-every-thread-android) (resolved).
 
 - [KTGL on NVN2: Switch 2 GLSLC outputs and LD_ / LI_ LINKDATA](../../../docs/reference/shaders.md#ktgl-on-nvn2-switch-2-glslc-outputs-and-ld_--li_-linkdata): the split found almost none of its shaders.
+- [Large KTGL IDRK entries and split memory](../../../docs/reference/shaders.md#large-ktgl-idrk-entries-and-split-memory): the split ran out of memory on `0x38f972af.fdata`; it now scans to private temporary storage and packages only selected shader payloads while retaining the complete map (device rerun pending).
+- [NativeAOT shader translation and JsonNode metadata](../../../docs/reference/shaders.md#nativeaot-shader-translation-and-jsonnode-metadata): Android shader preparation wrote a partial library after 3,384 metadata failures, leaving selected runtime shaders unavailable (translator fixed; device rerun pending).
 - [HADD2 and HMUL2 with an immediate](../../../docs/reference/shaders.md#hadd2-and-hmul2-with-an-immediate): the GPU hang and 88 ms frames.
 - [Scaled shared memory addresses](../../../docs/reference/shaders.md#scaled-shared-memory-addresses): stride 3 in use, on accesses of every size.
 - [HFMA2 .H0_NH1](../../../docs/reference/shaders.md#hfma2-h0_nh1).
