@@ -175,6 +175,12 @@ public final class MainActivity extends Activity {
                 .value("Keeps the busiest threads off the small cores").view);
         play.addView(new Ui.Setting(this, "📳", "Rumble", null).toggle(this, Prefs.rumble(this), (b, on) -> Prefs.rumbleDefault(this, on))
                 .value("On the controller, or the phone without one").view);
+        Ui.Setting xbox = new Ui.Setting(this, "🅰️", "Xbox button label swap", null).chevron(this);
+        xbox.view.setOnClickListener(v -> new AlertDialog.Builder(this).setTitle("Xbox button label swap")
+                .setSingleChoiceItems(Prefs.XBOX_NAMES, Prefs.xboxButtons(this), (d, w) -> { Prefs.xboxButtonsDefault(this, w); xbox.value(Prefs.xboxLabel(w)); d.dismiss(); })
+                .setNegativeButton("Cancel", null).show());
+        xbox.value(Prefs.xboxLabel(Prefs.xboxButtons(this)));
+        play.addView(xbox.view);
         lsfgRow = new Ui.Setting(this, "✨", "Frame generation", v -> frameGen()).chevron(this);
         play.addView(lsfgRow.view);
         TextView hint = Ui.small(this, "A game's own settings (⋯ on its card) override these.");

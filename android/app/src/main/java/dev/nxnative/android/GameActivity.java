@@ -462,6 +462,9 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
             if (Prefs.instancedDraws(this, id)) env.add("DM_VK_INSTANCE=1");   // Game settings › Instanced draws
             if (Prefs.classicPasses(this, id)) env.add("DM_VK_CLASSIC_RP=1");   // Game settings › Classic render passes
             pinStart();   // Use fast cores (Game settings, Settings)
+            int xb = Prefs.xboxButtons(this, id);   // Xbox button label swap (Game settings, Settings)
+            if (xb > 0) env.add("DM_XBOX_LABELS=1");
+            if (xb == 2) env.add("DM_PAD_LABELLED=2");
             env.addAll(user);
             for (String kv : env) if (kv.startsWith("DM_OVERLAY=")) overlayEnv = !kv.substring(11).trim().equals("0");
             String[] args = {"nxhost", packDir.getPath()};
