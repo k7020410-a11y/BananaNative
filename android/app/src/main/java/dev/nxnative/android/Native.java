@@ -120,4 +120,13 @@ final class Native {
     static native void fpsLimitSet(int fps);
     /** Places the replay thread on the phone's fastest cores and the encoder and the game's threads off the small ones (nxlaunch.c); the number placed by this call, -1 when the phone reports no clocks */
     static native int pinThreads();
+
+    /** The player a gamepad drives (0..7), -1 when it has none (yet). */
+    static native int devicePlayer(int device);
+
+    /** Rumble (Rumble.java): the listener's onRumble(player, intensity, sharpness) gets every change of a player's vibration; set once, before start. False without rumble in this host. */
+    static native boolean setRumbleListener(Object listener);
+
+    /** Whether a player has a vibrator: the host sends that player's vibration only while it has one. */
+    static native void rumbleRoute(int player, boolean on);
 }
