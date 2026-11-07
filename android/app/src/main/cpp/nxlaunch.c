@@ -367,6 +367,7 @@ JNIEXPORT jint JNICALL Java_dev_nxnative_android_Native_pinThreads(JNIEnv *env, 
     }
     closedir(d);
     return placed;
+}
 JNIEXPORT jint JNICALL Java_dev_nxnative_android_Native_devicePlayer(JNIEnv *env, jclass cls, jint device) {
     (void)env; (void)cls; return nxhost_input_device_player ? nxhost_input_device_player(device) : -1;
 }
